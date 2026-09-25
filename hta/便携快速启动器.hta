@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>便携快速启动器</title>
+<HTA:APPLICATION ID="app" APPLICATIONNAME="ToolboxLauncher" SINGLEINSTANCE="yes"
+  WINDOWSTATE="normal" BORDER="thin" CAPTION="yes" SHOWINTASKBAR="yes" SCROLL="no"
+  INNERBORDER="no" MAXIMIZEBUTTON="yes" MINIMIZEBUTTON="yes" />
+<style>
+ html,body{margin:0;padding:0;height:100%;font:13px "Microsoft YaHei","微软雅黑",SimSun,Tahoma;background:#f4f6f9;color:#22303f;}
+ #top{background:#1f4e79;color:#fff;padding:8px 10px;}
+ #top b{font-size:15px;font-weight:600;}
+ #searchbox{width:320px;height:24px;font-size:13px;padding:1px 6px;border:0;border-radius:3px;}
+ #wrap{position:absolute;top:74px;bottom:0;left:0;right:0;display:block;}
+ #side{position:absolute;top:0;bottom:0;left:0;width:168px;overflow:auto;background:#e9eef4;border-right:1px solid #cdd6e0;}
+ .panel{padding:6px 8px;cursor:pointer;border-bottom:1px solid #dde4ec;white-space:nowrap;overflow:hidden;}
+ .panel:hover{background:#dbe6f1;}
+ .panel.on{background:#1f4e79;color:#fff;}
+ .panel span{color:#7d8b9a;font-size:11px;margin-left:6px;}
+ .panel.on span{color:#cde;}
+ #main{position:absolute;top:0;bottom:0;left:169px;right:0;overflow:auto;}
+ table{border-collapse:collapse;width:100%;}
+ td{padding:4px 8px;border-bottom:1px solid #e5e9ef;vertical-align:top;}
+ tr.item{cursor:pointer;}
+ tr.item:hover{background:#eaf2fb;}
+ tr.sel{background:#cfe2f6 !important;}
+ .nm{font-weight:600;}
+ .pt{color:#7d8b9a;font-size:11.5px;}
+ .tag{font-size:11px;padding:0 4px;border-radius:2px;margin-left:6px;}
+ .tag.miss{background:#fdecea;color:#c0392b;border:1px solid #f5c6c2;}
+ .tag.abs{background:#fff8e1;color:#a67c00;border:1px solid #f0e0a8;}
+ #hint{position:absolute;bottom:0;left:169px;right:0;background:#eef2f7;border-top:1px solid #dfe6ee;color:#6b7a8d;font-size:11.5px;padding:3px 8px;}
+ #ctx{position:absolute;display:none;background:#fff;border:1px solid #b9c4d0;box-shadow:2px 2px 6px #bbb;z-index:99;padding:2px 0;}
+ #ctx div{padding:5px 16px;cursor:pointer;white-space:nowrap;font-size:12.5px;}
+ #ctx div:hover{background:#1f4e79;color:#fff;}
+ #tip{color:#dbe8f5;font-size:11.5px;margin-left:10px;}
+ a.btn{color:#fff;text-decoration:none;border:1px solid #6f9ecb;border-radius:3px;padding:2px 8px;margin-left:8px;font-size:12px;}
+ a.btn:hover{background:#2c6499;}
+</style>
+</head>
+<body onload="init()">
+<div id="top">
+  <b id="ttl">便携快速启动器</b>
+  <input id="searchbox" type="text" placeholder="输入关键字搜索（名称/路径），回车启动首个结果" onkeyup="onKey(event)">
+  <a class="btn" href="#" onclick="openRoot();return false;">打开工具箱目录</a>
+  <a class="btn" href="#" onclick="location.reload();return false;">重新载入</a>
+  <span id="tip"></span>
+</div>
+<div id="wrap">
+  <div id="side"></div>
+  <div id="main"><table id="tb"><tbody id="tbdy"></tbody></table></div>
+  <div id="hint">单击=启动 &nbsp;|&nbsp; 右键=更多（管理员运行 / 打开所在文件夹 / 复制路径） &nbsp;|&nbsp; ↑↓ 选择，回车启动，Esc 清空搜索</div>
+</div>
+<div id="ctx">
+  <div onclick="ctxRun(0)">启动</div>
+  <div onclick="ctxRun(1)">以管理员身份运行</div>
+  <div onclick="ctxRun(2)">打开所在文件夹</div>
+  <div onclick="ctxRun(3)">复制完整路径</div>
+</div>
+
+<script type="text/javascript" src="tools.js" charset="utf-8"></script>
+<script type="text/javascript">
+var fso, shApp;
+var curPanel = '*';
+var rows = [];      // {el, g, t, p, a, x, miss}
+
+function baseDir() {
+  var u = String(location.href);
+  var i = u.indexOf('///');
+  u = u.substring(i >= 0 ? i + 3 : 0);
+  u = u.substring(0, u.lastIndexOf('/'));
+  try { u = decodeURIComponent(u); } catch (e) { u = unescape(u); }
+  return u.replace(/\//g, '\\');
+}
+function fullPath(rel) {
+  if (/^[A-Za-z]:\\/.test(rel) || rel.indexOf('\\\\') === 0) return rel;
+  return baseDir() + '\\' + rel;
+}
+function init() {
+  try { fso = new ActiveXObject('Scripting.FileSystemObject'); } catch (e) { fso = null; }
+  try { try { shApp = new ActiveXObject('Shell.Application'); } catch (e) { shApp = null; } } catch (e) { shApp = null; }
+  if (typeof TITLE === 'string' && TITLE) { document.getElementById('ttl').innerHTML = TITLE + '（便携启动器）'; document.title = TITLE; }
+  buildSide();
+  render();
+  document.getElementById('searchbox').focus();
+}
+function buildSide() {
+  var side = document.getElementById('side');
+  var cnt = {}, order = [];
+  for (var i = 0; i < TOOLS.length; i++) {
+    var g = TOOLS[i].g;
+    if (!cnt[g]) { cnt[g] = 0; order.push(g); }
+    cnt[g]++;
+  }
+  var html = '<div class="panel on" id="pn0" onclick="setPanel(\'*\',this)">全部 <span>' + TOOLS.length + '</span></div>';
+  for (var j = 0; j < order.length; j++) {
+    html += '<div class="panel" id="pn' + (j + 1) + '" onclick="setPanel(\'' + esc(order[j]) + '\',this)">'
+         +  esc(order[j]) + ' <span>' + cnt[order[j]] + '</span></div>';
+  }
+  side.innerHTML = html;
+}
+function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function render() {
+  var kw = document.getElementById('searchbox').value.replace(/^\s+|\s+$/g, '').toLowerCase();
+  var tbdy = document.getElementById('tbdy');
+  var html = '', n = 0;
+  rows = [];
+  for (var i = 0; i < TOOLS.length; i++) {
+    var o = TOOLS[i];
+    if (curPanel !== '*' && o.g !== curPanel) continue;
+    var hay = (o.g + ' ' + o.t + ' ' + o.p).toLowerCase();
+    if (kw && hay.indexOf(kw) < 0) continue;
+    var fp = fullPath(o.p);
+    var miss = false;
+    if (fso) { try { miss = !(fso.FileExists(fp) || fso.FolderExists(fp)); } catch (e) { } }
+    var tag = '';
+    if (miss) tag += '<span class="tag miss">文件缺失</span>';
+    if (o.x) tag += '<span class="tag abs">原绝对路径</span>';
+    html += '<tr class="item" onclick="run(' + n + ',0)" oncontextmenu="showCtx(event,' + n + ');return false;">'
+         +  '<td style="width:34%"><span class="nm">' + esc(o.t) + '</span>' + tag + '</td>'
+         +  '<td><span class="pt">' + esc(o.p) + '</span></td></tr>';
+    rows.push({ g: o.g, t: o.t, p: o.p, a: o.a, fp: fp, miss: miss });
+    n++;
+  }
+  if (n === 0) html = '<tr><td style="padding:16px;color:#888">没有匹配的条目</td></tr>';
+  tbdy.innerHTML = html;
+  document.getElementById('tip').innerHTML = '共 ' + n + ' 项';
+}
+function setPanel(g, el) {
+  curPanel = g;
+  var ps = document.getElementById('side').getElementsByTagName('div');
+  for (var i = 0; i < ps.length; i++) ps[i].className = 'panel';
+  el.className = 'panel on';
+  render();
+}
+function run(n, mode) {
+  hideCtx();
+  if (n < 0 || n >= rows.length) return;
+  var r = rows[n], dir = r.fp.substring(0, r.fp.lastIndexOf('\\'));
+  if (r.miss) {
+    if (confirm('文件不存在：\n' + r.fp + '\n\n是否打开所在文件夹？')) shApp.ShellExecute('explorer.exe', '"' + dir + '"', '', 'open', 1);
+    return;
+  }
+  try {
+    if (/[.]ps1$/i.test(r.fp)) {
+      var ps = (mode === 1 ? 'runas' : 'open');
+      shApp.ShellExecute('powershell.exe', '-NoProfile -ExecutionPolicy Bypass -File "' + r.fp + '"', dir, ps, 1);
+      return;
+    }
+    if (mode === 1) shApp.ShellExecute(r.fp, r.a || '', dir, 'runas', 1);
+    else shApp.ShellExecute(r.fp, r.a || '', dir, 'open', 1);
+  } catch (e) { alert('启动失败：' + e.message); }
+}
+var ctxRow = -1;
+function showCtx(ev, n) {
+  ctxRow = n;
+  var c = document.getElementById('ctx');
+  var x = (ev.clientX || 0), y = (ev.clientY || 0);
+  c.style.left = x + 'px'; c.style.top = y + 'px'; c.style.display = 'block';
+  return false;
+}
+function hideCtx() { document.getElementById('ctx').style.display = 'none'; }
+function ctxRun(k) {
+  var n = ctxRow; hideCtx();
+  if (n < 0 || n >= rows.length) return;
+  var r = rows[n], dir = r.fp.substring(0, r.fp.lastIndexOf('\\'));
+  if (k === 0) run(n, 0);
+  else if (k === 1) run(n, 1);
+  else if (k === 2) shApp.ShellExecute('explorer.exe', '"' + dir + '"', '', 'open', 1);
+  else if (k === 3) { try { window.clipboardData.setData('Text', r.fp); alert('已复制：\n' + r.fp); } catch (e) { alert(r.fp); } }
+}
+function openRoot() { shApp.ShellExecute(baseDir(), '', '', 'open', 1); }
+function onKey(ev) {
+  var e = ev || window.event, k = e.keyCode;
+  if (k === 13) { render(); if (rows.length) run(0, 0); return false; }
+  if (k === 27) { document.getElementById('searchbox').value = ''; render(); return false; }
+  if (k === 40 || k === 38) { moveSel(k === 40 ? 1 : -1); return false; }
+  render();
+  return true;
+}
+function moveSel(d) {
+  var trs = document.getElementById('tbdy').getElementsByTagName('tr');
+  var idx = -1;
+  for (var i = 0; i < trs.length; i++) if (trs[i].className.indexOf('sel') >= 0) { idx = i; break; }
+  if (idx >= 0) trs[idx].className = 'item';
+  idx += d;
+  if (idx < 0) idx = 0;
+  if (idx > trs.length - 1) idx = trs.length - 1;
+  trs[idx].className = 'item sel';
+  try { trs[idx].scrollIntoView(false); } catch (e) { }
+}
+document.onclick = function () { hideCtx(); };
+</script>
+</body>
+</html>
