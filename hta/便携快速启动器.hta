@@ -79,7 +79,7 @@ function fullPath(rel) {
 }
 function init() {
   try { fso = new ActiveXObject('Scripting.FileSystemObject'); } catch (e) { fso = null; }
-  try { try { try { shApp = new ActiveXObject('Shell.Application'); } catch (e) { shApp = null; } } catch (e) { shApp = null; } } catch (e) { shApp = null; }
+  try { try { try { try { shApp = new ActiveXObject('Shell.Application'); } catch (e) { shApp = null; } } catch (e) { shApp = null; } } catch (e) { shApp = null; } } catch (e) { shApp = null; }
   if (typeof TITLE === 'string' && TITLE) { document.getElementById('ttl').innerHTML = TITLE + '（便携启动器）'; document.title = TITLE; }
   buildSide();
   render();

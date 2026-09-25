@@ -8,7 +8,7 @@ CC64=x86_64-w64-mingw32-gcc
 RC32=i686-w64-mingw32-windres
 RC64=x86_64-w64-mingw32-windres
 CFLAGS="-municode -mwindows -O2 -s -static -finput-charset=UTF-8"
-LIBS="-lcomctl32 -lshlwapi -lshell32 -luser32 -lgdi32 -lcomdlg32"
+LIBS="-lcomctl32 -lshlwapi -lshell32 -luser32 -lgdi32 -lcomdlg32 -lole32"
 
 python3 make_icon.py app.ico                     # 生成图标
 $RC32 -c 65001 app.rc app_res32.o                # 资源(图标/清单/版本信息)

@@ -20,13 +20,14 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.2"
+#define APP_VER     L"1.3"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
 
@@ -47,6 +48,10 @@
 #define IDM_ADD     2010
 #define IDM_EDIT    2011
 #define IDM_DEL     2012
+#define IDM_NEW     2020
+#define IDM_IMPORT  2021
+#define IDM_EXPORT  2022
+#define IDM_SCAN    2023
 #define IDM_VIEW_LIST 2100
 #define IDM_VIEW_ICON 2101
 #define WM_APP_LOAD      (WM_APP + 10)
@@ -616,10 +621,10 @@ static void load_config(void)
                 WCHAR *v = line + 6;
                 while (*v == L' ' || *v == L'\t') v++;
                 g_viewPref = (StrStrIW(v, L"icon") || StrStrIW(v, L"图标")) ? 1 : 0;
-            } else {
+            } else if (_wcsnicmp(line, L"# 本文件由", 5) && _wcsnicmp(line, L"# 路径可写相对本程序目录", 12)) {
                 size_t ln = wcslen(line);  /* 去掉行尾 \r 再存，避免回写时多出一个 ^M */
                 while (ln && (line[ln - 1] == L'\r' || line[ln - 1] == L' ' || line[ln - 1] == L'\t')) line[--ln] = 0;
-                header_add(line);          /* 其余注释行原样保留 */
+                header_add(line);          /* 其余注释行原样保留（自家那两行固定说明每次重新生成） */
             }
             continue;
         }
@@ -665,22 +670,45 @@ static int write_crlf(HANDLE h)
     WriteFile(h, "\r\n", 2, &wr, NULL);
     return 1;
 }
-static int save_config(void)
+/* 把条目写进一个已打开的文件；onlyVisible=1 时只写当前列表里显示的那些 */
+static void write_items(HANDLE h, int onlyVisible)
+{
+    WCHAR line[4096];
+    int idx, n = onlyVisible ? g_views : g_count;
+    for (idx = 0; idx < n; idx++) {
+        ITEM *it = &g_items[onlyVisible ? g_view[idx] : idx];
+        WCHAR panel[64], title[256], rel[1024], args[512];
+        wcsncpy(panel, it->panel, 63); panel[63] = 0;
+        wcsncpy(title, it->title, 255); title[255] = 0;
+        wcsncpy(rel,   it->rel,  1023); rel[1023] = 0;
+        wcsncpy(args,  it->args,  511); args[511] = 0;
+        sanitize_field(panel); sanitize_field(title); sanitize_field(rel); sanitize_field(args);
+        _snwprintf(line, 4095, L"%s|%s|%s|%s", panel, title, rel, args);
+        line[4095] = 0;
+        write_conv(h, line); write_crlf(h);
+    }
+}
+
+/* 写配置；path/cp 可指定（导出用），onlyVisible 只写当前显示 */
+static int save_config_ex(const WCHAR *path, UINT cp, int onlyVisible, int backup)
 {
     WCHAR bak[MAX_PATH * 2 + 8];
     WCHAR line[4096];
     HANDLE h;
     DWORD wr;
-    int i;
+    UINT oldCP = g_cfgCP;
 
-    if (!g_cfgPath[0]) return 0;
-    /* 只备份一次（保留最初版本，防止误改无法回退） */
-    wcsncpy(bak, g_cfgPath, MAX_PATH * 2 - 1); bak[MAX_PATH * 2 - 1] = 0;
-    wcsncat(bak, L".bak", 8);
-    if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES)
-        CopyFileW(g_cfgPath, bak, TRUE);
-
-    h = CreateFileW(g_cfgPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    if (!path || !*path) return 0;
+    if (backup) {
+        /* 只备份一次（保留最初版本，防止误改无法回退） */
+        wcsncpy(bak, path, MAX_PATH * 2 - 1); bak[MAX_PATH * 2 - 1] = 0;
+        wcsncat(bak, L".bak", 8);
+        if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES)
+            CopyFileW(path, bak, TRUE);
+    }
+    g_cfgCP = cp;                       /* write_conv 按 g_cfgCP 转码 */
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) { g_cfgCP = oldCP; return 0; }
     if (h == INVALID_HANDLE_VALUE) return 0;
     if (g_cfgCP == CP_UTF8) {
         const char bom[3] = { (char)0xEF, (char)0xBB, (char)0xBF };
@@ -696,21 +724,16 @@ static int save_config(void)
     line[4095] = 0;
     write_conv(h, line); write_crlf(h);
     if (g_viewPref) { write_conv(h, L"#VIEW=icon"); write_crlf(h); }
-    if (g_header && g_headerLen) { write_conv(h, g_header); }
-    for (i = 0; i < g_count; i++) {
-        WCHAR panel[64], title[256], rel[1024], args[512];
-        wcsncpy(panel, g_items[i].panel, 63); panel[63] = 0;
-        wcsncpy(title, g_items[i].title, 255); title[255] = 0;
-        wcsncpy(rel,   g_items[i].rel,  1023); rel[1023] = 0;
-        wcsncpy(args,  g_items[i].args,  511); args[511] = 0;
-        sanitize_field(panel); sanitize_field(title); sanitize_field(rel); sanitize_field(args);
-        _snwprintf(line, 4095, L"%s|%s|%s|%s", panel, title, rel, args);
-        line[4095] = 0;
-        write_conv(h, line); write_crlf(h);
-    }
+    if (g_header && g_headerLen) write_conv(h, g_header);
+    write_items(h, onlyVisible);
     FlushFileBuffers(h);
     CloseHandle(h);
+    g_cfgCP = oldCP;
     return 1;
+}
+static int save_config(void)
+{
+    return save_config_ex(g_cfgPath, g_cfgCP, 0, 1);
 }
 
 /* ---------- 过滤 + 刷新列表 ---------- */
@@ -942,7 +965,7 @@ static void show_save_error(void)
 }
 
 /* ---------- 文件选择 ---------- */
-static int pick_files(HWND owner, WCHAR out[][MAX_PATH * 2], int maxn, const WCHAR *title)
+static int pick_files(HWND owner, WCHAR out[][MAX_PATH * 2], int maxn, const WCHAR *title, const WCHAR *filter)
 {
     static WCHAR buf[32768];
     OPENFILENAMEW ofn;
@@ -951,7 +974,8 @@ static int pick_files(HWND owner, WCHAR out[][MAX_PATH * 2], int maxn, const WCH
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = owner ? owner : g_hMain;
-    ofn.lpstrFilter = L"程序与脚本 (*.exe;*.bat;*.cmd;*.ps1;*.lnk;*.msi)\0*.exe;*.bat;*.cmd;*.ps1;*.lnk;*.msi;*.com;*.scr\0所有文件 (*.*)\0*.*\0\0";
+    ofn.lpstrFilter = filter ? filter :
+        L"程序与脚本 (*.exe;*.bat;*.cmd;*.ps1;*.lnk;*.msi)\0*.exe;*.bat;*.cmd;*.ps1;*.lnk;*.msi;*.com;*.scr\0所有文件 (*.*)\0*.*\0\0";
     ofn.lpstrFile = buf;
     ofn.nMaxFile = 32768;
     ofn.lpstrTitle = title;
@@ -976,6 +1000,391 @@ static int pick_files(HWND owner, WCHAR out[][MAX_PATH * 2], int maxn, const WCH
         p += wcslen(p) + 1;
     }
     return n;
+}
+
+
+/* ================= 导入 / 导出 / 新建 ================= */
+/* base64 + swapcase 解密（Rolan 的 cfg/rcb 就是这个"假加密"） */
+static int b64v(WCHAR c)
+{
+    if (c >= L'A' && c <= L'Z') return (int)(c - L'A');
+    if (c >= L'a' && c <= L'z') return (int)(c - L'a') + 26;
+    if (c >= L'0' && c <= L'9') return (int)(c - L'0') + 52;
+    if (c == L'+') return 62;
+    if (c == L'/') return 63;
+    return -1;
+}
+static WCHAR *rolan_decrypt(const WCHAR *s)
+{
+    size_t n = wcslen(s), i;
+    WCHAR *sw;
+    char *bin;
+    int bn = 0, acc = 0, bits = 0, need;
+    WCHAR *out = NULL;
+    if (n == 0) return NULL;
+    sw = (WCHAR *)malloc((n + 1) * sizeof(WCHAR));
+    bin = (char *)malloc(n + 8);
+    if (!sw || !bin) { free(sw); free(bin); return NULL; }
+    for (i = 0; i < n; i++) {                       /* ① 大小写互换 */
+        WCHAR c = s[i];
+        if (c >= L'A' && c <= L'Z') c = (WCHAR)(c - L'A' + L'a');
+        else if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        sw[i] = c;
+    }
+    sw[n] = 0;
+    for (i = 0; i < n; i++) {                       /* ② base64 解码 */
+        int v = b64v(sw[i]);
+        if (v < 0) continue;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; bin[bn++] = (char)((acc >> bits) & 0xFF); }
+    }
+    free(sw);
+    bin[bn] = 0;
+    need = MultiByteToWideChar(936, 0, bin, bn, NULL, 0);   /* ③ GBK → 宽字符 */
+    if (need <= 0) need = MultiByteToWideChar(CP_ACP, 0, bin, bn, NULL, 0);
+    if (need > 0) {
+        out = (WCHAR *)malloc((need + 2) * sizeof(WCHAR));
+        if (out) {
+            if (!MultiByteToWideChar(936, 0, bin, bn, out, need))
+                MultiByteToWideChar(CP_ACP, 0, bin, bn, out, need);
+            out[need] = 0;
+        }
+    }
+    free(bin);
+    return out;
+}
+/* 从 Title:"x",Path:"y",Parm:"z" 这种串里取字段 */
+static void qfield(const WCHAR *s, const WCHAR *name, WCHAR *out, size_t cap)
+{
+    const WCHAR *p = StrStrIW(s, name);
+    out[0] = 0;
+    if (!p) return;
+    p += wcslen(name);
+    if (*p != L'"') return;
+    p++;
+    size_t i = 0;
+    while (p[i] && p[i] != L'"' && i < cap - 1) { out[i] = p[i]; i++; }
+    out[i] = 0;
+    while (i > 0 && (out[i - 1] == L' ' || out[i - 1] == L'\r')) out[--i] = 0;
+}
+/* 把 Rolan 明文里的路径规范化：去掉 %rp%\ 前缀、斜杠转反斜杠 */
+static void clean_rel(const WCHAR *in, WCHAR *out, size_t cap)
+{
+    const WCHAR *p = in;
+    size_t i = 0;
+    while (!_wcsnicmp(p, L"%rp%", 4)) { p += 4; if (*p == L'\\' || *p == L'/') p++; }
+    while (*p == L'\\' || *p == L'/') p++;
+    while (*p && i < cap - 1) { out[i++] = (*p == L'/') ? L'\\' : *p; p++; }
+    out[i] = 0;
+}
+/* 解析本启动器格式的一行：面板|名称|路径|参数 */
+static int parse_line(const WCHAR *line, WCHAR *panel, size_t pcap, WCHAR *title, size_t tcap,
+                      WCHAR *rel, size_t rcap, WCHAR *args, size_t acap)
+{
+    WCHAR f0[1024], f1[1024], f2[2048], f3[1024];
+    const WCHAR *f[4];
+    int nf = 0;
+    const WCHAR *seg = line;
+    size_t len = 0;
+    /* 用固定缓冲区切 4 段 */
+    WCHAR *dst[4] = { f0, f1, f2, f3 };
+    size_t dcap[4] = { 1024, 1024, 2048, 1024 };
+    const WCHAR *q = line;
+    for (;;) {
+        if (*q == 0 || (*q == L'|' || *q == L'\t') || nf == 3 && *q == 0) {
+            size_t j = 0;
+            const WCHAR *s2 = seg;
+            while (s2 < q && j < dcap[nf] - 1) dst[nf][j++] = *s2++;
+            dst[nf][j] = 0;
+            nf++;
+            if (*q == 0 || nf >= 4) break;
+            seg = q + 1;
+        }
+        if (*q == 0) break;
+        q++;
+    }
+    while (nf < 3) { dst[nf][0] = 0; nf++; }
+    f[0] = f0; f[1] = f1; f[2] = f2; f[3] = f3;
+    (void)len;
+    if (!f0[0] || !f1[0] || !f2[0]) return 0;
+    copy_field(panel, pcap, f0, wcslen(f0));
+    copy_field(title, tcap, f1, wcslen(f1));
+    copy_field(rel,   rcap, f2, wcslen(f2));
+    copy_field(args,  acap, f3, wcslen(f3));
+    return 1;
+}
+/* 导入一个文件；返回新增条数。kind 里回填识别出的类型 */
+static int import_file_core(const WCHAR *path, int replace, int *dup, const WCHAR **kind, WCHAR *newTitle, size_t tcap)
+{
+    WCHAR *text = NULL;
+    int added = 0, isRolan = 0;
+    const WCHAR *ext = wcsrchr(path, L'.');
+    *dup = 0;
+    *kind = L"启动器配置";
+    newTitle[0] = 0;
+    if (ext && (!_wcsicmp(ext, L".cfg") || !_wcsicmp(ext, L".rcb"))) {
+        text = read_text_file(path, CP_ACP);         /* Rolan 的 cfg/rcb 是 GBK */
+        if (!text) text = read_text_file(path, CP_UTF8);
+    } else {
+        text = read_text_file(path, CP_UTF8);
+        if (!text) text = read_text_file(path, CP_ACP);
+    }
+    if (!text) { *kind = L"（读不出内容）"; return -1; }
+    if ((ext && (!_wcsicmp(ext, L".cfg") || !_wcsicmp(ext, L".rcb"))) || StrStrIW(text, L"[Data]"))
+        isRolan = 1;
+
+    if (replace) g_count = 0;
+    if (isRolan) {
+        const WCHAR *p = StrStrIW(text, L"[Data]");
+        *kind = L"Rolan 配置";
+        if (p) {
+            const WCHAR *nl = wcschr(p, L'\n');        /* 从 [Data] 的下一行开始 */
+            p = nl ? nl + 1 : NULL;
+        }
+        if (p) {
+            while (*p) {
+                /* 取一行 */
+                WCHAR line[8192];
+                size_t n = 0;
+                while (*p && *p != L'\n' && n < 8191) line[n++] = *p++;
+                line[n] = 0;
+                if (*p == L'\n') p++;
+                while (n && (line[n - 1] == L'\r' || line[n - 1] == L' ')) line[--n] = 0;
+                if (!line[0]) continue;
+                if (line[0] == L'[') break;                 /* 下一个段 */
+                {
+                    WCHAR *eq = wcschr(line, L'=');
+                    WCHAR *panelW, *items;
+                    if (!eq) continue;
+                    *eq = 0;
+                    items = eq + 1;
+                    panelW = rolan_decrypt(line);
+                    if (!panelW || !panelW[0]) { free(panelW); continue; }
+                    /* 逗号分隔的条目密文 */
+                    {
+                        WCHAR *tok = items, *q = items;
+                        for (;;) {
+                            if (*q == L',' || *q == 0) {
+                                WCHAR save = *q;
+                                WCHAR *dec;
+                                *q = 0;
+                                dec = rolan_decrypt(tok);
+                                *q = save;
+                                if (dec && dec[0]) {
+                                    WCHAR t[512], rp[2048], pm[512], rel[2048];
+                                    qfield(dec, L"Title:", t, 512);
+                                    qfield(dec, L",Path:", rp, 2048);   /* 前面带逗号，避免匹到 IcoPath */
+                                    qfield(dec, L"Parm:", pm, 512);
+                                    clean_rel(rp, rel, 2048);
+                                    if (t[0] && rel[0]) {
+                                        if (item_exists(panelW, rel)) (*dup)++;
+                                        else if (add_item_raw(panelW, t, rel, pm)) added++;
+                                    }
+                                    free(dec);
+                                }
+                                if (save == 0) break;
+                                tok = q + 1;
+                            }
+                            q++;
+                        }
+                    }
+                    free(panelW);
+                }
+            }
+        }
+    } else {
+        const WCHAR *p = text;
+        while (*p) {
+            WCHAR line[4096];
+            size_t n = 0;
+            WCHAR panel[64], title[256], rel[1024], args[512];
+            while (*p && *p != L'\n' && n < 4095) line[n++] = *p++;
+            line[n] = 0;
+            if (*p == L'\n') p++;
+            {
+                WCHAR *L2 = line;
+                while (*L2 == L' ' || *L2 == L'\t' || *L2 == L'\r') L2++;
+                size_t ln = wcslen(L2);
+                while (ln && (L2[ln - 1] == L'\r' || L2[ln - 1] == L' ')) L2[--ln] = 0;
+                if (!L2[0]) continue;
+                if (L2[0] == L'#' || (L2[0] == L'/' && L2[1] == L'/')) {
+                    if (!_wcsnicmp(L2, L"#TITLE=", 7)) copy_field(newTitle, tcap, L2 + 7, wcslen(L2 + 7));
+                    continue;
+                }
+                if (parse_line(L2, panel, 64, title, 256, rel, 1024, args, 512)) {
+                    WCHAR rel2[1024];
+                    clean_rel(rel, rel2, 1024);
+                    if (item_exists(panel, rel2)) (*dup)++;
+                    else if (add_item_raw(panel, title, rel2, args)) added++;
+                }
+            }
+        }
+    }
+    free(text);
+    return added;
+}
+static void reload_all(void);
+
+/* 图形界面：导入 / 导出 / 从文件夹新建 / 新建空配置 */
+static void do_import(void)
+{
+    static WCHAR picked[2][MAX_PATH * 2];
+    WCHAR msg[600], newTitle[128];
+    const WCHAR *kind;
+    int dup = 0, added, r;
+    int n = pick_files(g_hMain, picked, 1, L"选择要导入的配置（启动器 txt 或 Rolan 的 cfg/rcb）",
+        L"配置文件 (*.txt;*.cfg;*.rcb)\0*.txt;*.cfg;*.rcb\0所有文件 (*.*)\0*.*\0\0");
+    if (n <= 0) return;
+    load_config();                       /* 先保证内存里是磁盘上的最新内容 */
+    _snwprintf(msg, 599, L"把「%s」导入到当前配置？\n\n【是】合并：保留现有 %d 条，重复的跳过\n【否】替换：先清空现有条目再导入\n【取消】放弃",
+               base_name(picked[0]), g_count);
+    msg[599] = 0;
+    r = MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONQUESTION | MB_YESNOCANCEL);
+    if (r == IDCANCEL) return;
+    added = import_file_core(picked[0], r == IDNO, &dup, &kind, newTitle, 128);
+    if (added < 0) { MessageBoxW(g_hMain, L"这个文件读不出内容。", APP_NAME, MB_ICONERROR); return; }
+    if (newTitle[0] && r == IDNO) copy_field(g_appTitle, 128, newTitle, wcslen(newTitle));
+    if (!save_config()) { show_save_error(); return; }
+    reload_all();
+    _snwprintf(msg, 599, L"导入完成（%s）：新增 %d 条，跳过重复 %d 条，现在共 %d 条。", kind, added, dup, g_count);
+    msg[599] = 0;
+    MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+}
+static void do_export(void)
+{
+    static WCHAR buf[MAX_PATH * 2];
+    OPENFILENAMEW ofn;
+    WCHAR def[MAX_PATH * 2];
+    int onlyVisible, r;
+    if (!g_count) { MessageBoxW(g_hMain, L"当前配置里还没有条目。", APP_NAME, MB_ICONINFORMATION); return; }
+    r = MessageBoxW(g_hMain, L"导出哪些条目？\n\n【是】全部条目\n【否】只导出当前列表里显示的（搜索结果/面板过滤后）\n【取消】放弃",
+                    APP_NAME, MB_ICONQUESTION | MB_YESNOCANCEL);
+    if (r == IDCANCEL) return;
+    onlyVisible = (r == IDNO);
+    join_path(def, MAX_PATH * 2, g_root, L"tools_utf8_导出.txt");
+    wcsncpy(buf, def, MAX_PATH * 2 - 1); buf[MAX_PATH * 2 - 1] = 0;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hMain;
+    ofn.lpstrFilter = L"配置文本 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0";
+    ofn.lpstrFile = buf;
+    ofn.nMaxFile = MAX_PATH * 2;
+    ofn.lpstrDefExt = L"txt";
+    ofn.lpstrTitle = L"导出配置（UTF-8 文本）";
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if (!GetSaveFileNameW(&ofn)) return;
+    if (!save_config_ex(buf, CP_UTF8, onlyVisible, 0)) {
+        MessageBoxW(g_hMain, L"写文件失败（目标可能只读或被占用）。", APP_NAME, MB_ICONERROR);
+        return;
+    }
+    _snwprintf(def, MAX_PATH * 2 - 1, L"已导出 %d 条到：\n%s\n\nUTF-8 编码，本启动器（或任何文本编辑器）都能再读回来。",
+               onlyVisible ? g_views : g_count, buf);
+    def[MAX_PATH * 2 - 1] = 0;
+    MessageBoxW(g_hMain, def, APP_NAME, MB_ICONINFORMATION);
+}
+static int scan_folder_rec(const WCHAR *dir, const WCHAR *panel, int recurse, int *dup, int depth)
+{
+    static const WCHAR *exts[] = { L".exe", L".bat", L".cmd", L".ps1", L".lnk", L".msi", L".com", L".scr", L".vbs", L".reg" };
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    WCHAR pat[MAX_PATH * 2];
+    int added = 0, i;
+    if (depth > 6) return 0;
+    join_path(pat, MAX_PATH * 2, dir, L"*");
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (recurse) {
+                WCHAR sub[MAX_PATH * 2];
+                join_path(sub, MAX_PATH * 2, dir, fd.cFileName);
+                added += scan_folder_rec(sub, panel, recurse, dup, depth + 1);
+            }
+            continue;
+        }
+        {
+            const WCHAR *dot = wcsrchr(fd.cFileName, L'.');
+            int ok = 0;
+            if (!dot) continue;
+            for (i = 0; i < (int)(sizeof(exts) / sizeof(exts[0])); i++) if (!_wcsicmp(dot, exts[i])) { ok = 1; break; }
+            if (!ok) continue;
+            {
+                WCHAR full[MAX_PATH * 2], rel[MAX_PATH * 2], nm[256];
+                join_path(full, MAX_PATH * 2, dir, fd.cFileName);
+                to_rel(full, rel, MAX_PATH * 2);
+                stem_name(full, nm, 256);
+                if (item_exists(panel, rel)) { (*dup)++; continue; }
+                if (!add_item_raw(panel, nm, rel, L"")) break;
+                added++;
+            }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return added;
+}
+static void do_scan_folder(void)
+{
+    BROWSEINFOW bi;
+    LPITEMIDLIST idl;
+    WCHAR dir[MAX_PATH * 2], panel[64], msg[800], leaf[MAX_PATH * 2];
+    const WCHAR *b;
+    int recurse, dup = 0, added;
+    int r;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.hwndOwner = g_hMain;
+    bi.lpszTitle = L"选择要扫描的工具文件夹（里面的 exe/bat/ps1 会按文件夹名建一个面板）";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);          /* BIF_NEWDIALOGSTYLE 需要 COM 初始化 */
+    idl = SHBrowseForFolderW(&bi);
+    if (idl) {
+        if (!SHGetPathFromIDListW(idl, dir)) { CoTaskMemFree(idl); CoUninitialize(); return; }
+        CoTaskMemFree(idl);
+    } else {
+        /* 文件夹选择框不可用（被组策略禁用等）时的退路：让用户点该文件夹里的任意一个文件 */
+        static WCHAR picked[2][MAX_PATH * 2];
+        WCHAR *sl;
+        CoUninitialize();
+        if (MessageBoxW(g_hMain, L"文件夹选择框没有打开（可能被系统策略禁用）。\n\n改成“进入该文件夹、点里面的任意一个文件”来确定目录？",
+                        APP_NAME, MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+        if (pick_files(g_hMain, picked, 1, L"点这个文件夹里的任意一个文件", NULL) <= 0) return;
+        wcsncpy(dir, picked[0], MAX_PATH * 2 - 1); dir[MAX_PATH * 2 - 1] = 0;
+        sl = wcsrchr(dir, L'\\');
+        if (sl) *sl = 0;
+        if (!dir[0]) return;
+    }
+    CoUninitialize();
+    r = MessageBoxW(g_hMain, L"要连着子文件夹一起扫描吗？\n\n【是】包含子文件夹\n【否】只扫这一层", APP_NAME,
+                    MB_ICONQUESTION | MB_YESNOCANCEL);
+    if (r == IDCANCEL) return;
+    recurse = (r == IDYES);
+    load_config();
+    b = base_name(dir);
+    copy_field(panel, 64, b && *b ? b : L"新面板", wcslen(b && *b ? b : L"新面板"));
+    added = scan_folder_rec(dir, panel, recurse, &dup, 0);
+    if (added > 0) {
+        if (!save_config()) { show_save_error(); return; }
+        reload_all();
+    }
+    _snwprintf(msg, 799, L"扫描完成：加入面板【%s】%d 个工具（跳过重复 %d 个）。\n目录：%s%s",
+               panel, added, dup, dir, added ? L"" : L"\n\n（没找到 exe/bat/ps1/lnk/msi 这类可执行文件）");
+    msg[799] = 0;
+    MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+}
+static void do_new_config(void)
+{
+    WCHAR msg[600];
+    if (!g_count) { MessageBoxW(g_hMain, L"当前配置本来就是空的。", APP_NAME, MB_ICONINFORMATION); return; }
+    _snwprintf(msg, 599, L"新建空配置：清空列表里的 %d 条记录（磁盘上的工具文件不动，配置会立即写回并已自动备份 .bak）。\n\n确定要清空吗？",
+               g_count);
+    msg[599] = 0;
+    if (MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONWARNING | MB_YESNO) != IDYES) return;
+    g_count = 0;
+    if (!save_config()) { show_save_error(); return; }
+    reload_all();
+    MessageBoxW(g_hMain, L"已清空。接下来可以用「添加工具」(Ctrl+N)、拖入文件、或「从文件夹批量新建」把工具加回来。",
+                APP_NAME, MB_ICONINFORMATION);
 }
 
 /* ---------- 添加/编辑对话框（普通窗口 + 模态消息循环，不依赖资源） ---------- */
@@ -1060,7 +1469,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_DLG_CANCEL || id == IDCANCEL) { g_dlgOK = 0; DestroyWindow(h); return 0; }
         if (id == IDC_DLG_BROWSE && code == BN_CLICKED) {
             WCHAR picked[8][MAX_PATH * 2];
-            int n = pick_files(h, picked, 8, L"选择要添加的工具");
+            int n = pick_files(h, picked, 8, L"选择要添加的工具", NULL);
             if (n == 1) {
                 WCHAR rel[MAX_PATH * 2], nm[256];
                 to_rel(picked[0], rel, MAX_PATH * 2);
@@ -1263,7 +1672,7 @@ static void add_many(const WCHAR src[][MAX_PATH * 2], int n)
 static void do_add_tools(void)
 {
     static WCHAR picked[64][MAX_PATH * 2];
-    int n = pick_files(g_hMain, picked, 64, L"选择要添加的工具（可多选）");
+    int n = pick_files(g_hMain, picked, 64, L"选择要添加的工具（可多选）", NULL);
     if (n <= 0) return;
     if (n == 1) add_one_interactive(picked[0]);
     else add_many((const WCHAR (*)[MAX_PATH * 2])picked, n);
@@ -1382,6 +1791,11 @@ static void build_menu(HWND hwnd)
 {
     HMENU mb = CreateMenu(), m1 = CreatePopupMenu(), m2 = CreatePopupMenu(), m3 = CreatePopupMenu();
     HMENU m4 = CreatePopupMenu();
+    AppendMenuW(m1, MF_STRING, IDM_NEW,     L"新建空配置(&N)…");
+    AppendMenuW(m1, MF_STRING, IDM_IMPORT,  L"导入配置(&I)…（支持 Rolan 的 cfg/rcb）");
+    AppendMenuW(m1, MF_STRING, IDM_SCAN,    L"从文件夹批量新建(&F)…");
+    AppendMenuW(m1, MF_STRING, IDM_EXPORT,  L"导出配置(&E)…");
+    AppendMenuW(m1, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m1, MF_STRING, IDM_RELOAD,  L"重新载入配置(&R)\tF5");
     AppendMenuW(m1, MF_STRING, IDM_OPENDIR, L"打开工具箱目录(&O)");
     AppendMenuW(m1, MF_SEPARATOR, 0, NULL);
@@ -1505,6 +1919,9 @@ static void show_list_menu(BOOL blank)
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     }
     AppendMenuW(m, MF_STRING, IDM_ADD,     L"添加工具…");
+    AppendMenuW(m, MF_STRING, IDM_IMPORT,  L"导入配置…");
+    AppendMenuW(m, MF_STRING, IDM_SCAN,    L"从文件夹批量新建…");
+    AppendMenuW(m, MF_STRING, IDM_EXPORT,  L"导出配置…");
     AppendMenuW(m, MF_STRING, IDM_RELOAD,  L"重新载入配置");
     AppendMenuW(m, MF_STRING, IDM_OPENDIR, L"打开工具箱目录");
     TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hMain, NULL);
@@ -1564,6 +1981,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case IDM_ADD:     do_add_tools(); return 0;
         case IDM_EDIT:    do_edit_item(); return 0;
         case IDM_DEL:     do_del_item(); return 0;
+        case IDM_NEW:     do_new_config(); return 0;
+        case IDM_IMPORT:  do_import(); return 0;
+        case IDM_EXPORT:  do_export(); return 0;
+        case IDM_SCAN:    do_scan_folder(); return 0;
         case IDM_RELOAD:  reload_all(); return 0;
         case IDM_OPENDIR: ShellExecuteW(hwnd, L"open", g_root, NULL, NULL, SW_SHOWNORMAL); return 0;
         case IDM_README: {
@@ -1586,6 +2007,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 L"· 配置为同目录 tools_utf8.txt（UTF-8），界面里的增删改会直接写回该文件，\n"
                 L"  首次写回前自动备份为 tools_utf8.txt.bak；路径相对本程序所在目录，\n"
                 L"  所以整个工具箱换盘符、换电脑都不会失效\n\n"
+                L"· 文件菜单里还能：新建空配置（清空）/ 导入配置（支持 Rolan 的 cfg、rcb）/\n"
+                L"  从文件夹批量新建（扫描目录里的 exe、bat、ps1 建一个面板）/ 导出配置（另存为 txt）\n\n"
                 L"Ctrl+1 列表视图(带小图标)　·　Ctrl+2 图标视图(大图标)　·　Ctrl+N 添加工具\n"
                 L"F5 重载　·　Esc 清空搜索　·　在 tools_utf8.txt 里写一行 #VIEW=icon 可把大图标视图设为默认。",
                 APP_NAME, MB_ICONINFORMATION);
@@ -1847,6 +2270,61 @@ static void icon_bench(const WCHAR *outfile)
     write_report(outfile, rep);
 }
 
+/* 隐藏测试用：导入 / 导出 / 扫描 / 新建空配置 */
+static void cli_import(const WCHAR *file, const WCHAR *report, int replace)
+{
+    static WCHAR rep[4096];
+    WCHAR newTitle[128];
+    const WCHAR *kind;
+    int dup = 0, added;
+    load_config();
+    added = import_file_core(file, replace, &dup, &kind, newTitle, 128);
+    if (added < 0) { _snwprintf(rep, 4095, L"导入失败：读不出内容\r\n"); rep[4095] = 0; write_report(report, rep); return; }
+    if (newTitle[0] && replace) copy_field(g_appTitle, 128, newTitle, wcslen(newTitle));
+    save_config();
+    _snwprintf(rep, 4095, L"类型=%s\r\n新增=%d 重复=%d 现有=%d\r\n标题=%s\r\n配置=%s\r\n",
+               kind, added, dup, g_count, g_appTitle, g_cfgPath);
+    rep[4095] = 0;
+    write_report(report, rep);
+}
+static void cli_export(const WCHAR *file, const WCHAR *report, int onlyVisible)
+{
+    static WCHAR rep[4096];
+    int ok;
+    load_config();
+    ok = save_config_ex(file, CP_UTF8, onlyVisible, 0);
+    _snwprintf(rep, 4095, L"导出=%s 条数=%d 目标=%s\r\n", ok ? L"成功" : L"失败",
+               onlyVisible ? g_views : g_count, file);
+    rep[4095] = 0;
+    write_report(report, rep);
+}
+static void cli_scan(const WCHAR *dir, const WCHAR *report, int recurse)
+{
+    static WCHAR rep[4096];
+    WCHAR panel[64];
+    const WCHAR *b = base_name(dir);
+    int dup = 0, added;
+    load_config();
+    copy_field(panel, 64, b && *b ? b : L"新面板", wcslen(b && *b ? b : L"新面板"));
+    added = scan_folder_rec(dir, panel, recurse, &dup, 0);
+    if (added > 0) save_config();
+    _snwprintf(rep, 4095, L"面板=%s 新增=%d 重复=%d 现有=%d 递归=%d\r\n", panel, added, dup, g_count, recurse);
+    rep[4095] = 0;
+    write_report(report, rep);
+}
+static void cli_newcfg(const WCHAR *report)
+{
+    static WCHAR rep[2048];
+    int was;
+    load_config();
+    was = g_count;
+    g_count = 0;
+    save_config();
+    _snwprintf(rep, 2047, L"清空前=%d 清空后=%d 配置=%s\r\n", was, g_count, g_cfgPath);
+    rep[2047] = 0;
+    write_report(report, rep);
+}
+
 /* 隐藏测试用：--additem "面板|名称|相对路径|参数" [报告文件]  走与界面相同的添加+保存逻辑 */
 static void cli_additem(const WCHAR *spec, const WCHAR *outfile)
 {
@@ -1891,6 +2369,30 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
     if (argc > 1 && (!_wcsicmp(argv[1], L"--icons") || !_wcsicmp(argv[1], L"-icons"))) {
         if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
         icon_bench(out);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
+    if (argc > 1 && !_wcsicmp(argv[1], L"--import")) {
+        if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
+        cli_import(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"replace")));
+        if (argv) LocalFree(argv);
+        return 0;
+    }
+    if (argc > 1 && !_wcsicmp(argv[1], L"--export")) {
+        if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
+        cli_export(argc > 2 ? argv[2] : L"", out, 0);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
+    if (argc > 1 && !_wcsicmp(argv[1], L"--scan")) {
+        if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
+        cli_scan(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"r")));
+        if (argv) LocalFree(argv);
+        return 0;
+    }
+    if (argc > 1 && !_wcsicmp(argv[1], L"--newcfg")) {
+        if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
+        cli_newcfg(out);
         if (argv) LocalFree(argv);
         return 0;
     }
