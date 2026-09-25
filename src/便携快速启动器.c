@@ -26,7 +26,7 @@
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.1"
+#define APP_VER     L"1.2"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
 
@@ -49,8 +49,12 @@
 #define IDM_DEL     2012
 #define IDM_VIEW_LIST 2100
 #define IDM_VIEW_ICON 2101
-#define WM_APP_FILLICONS (WM_APP + 11)
+#define WM_APP_LOAD      (WM_APP + 10)
+#define WM_APP_STEP      (WM_APP + 11)   /* 后台小步：先查文件、再填图标，然后强制重绘 */
 #define ICON_CHUNK 16
+#define CHECK_CHUNK 24
+#define PX16 (16 * 16 * 4)
+#define PX32 (32 * 32 * 4)
 
 /* 添加/编辑 对话框控件 */
 #define IDC_DLG_L1    3101
@@ -101,9 +105,14 @@ static WNDPROC g_oldEdit, g_oldList;
 static HIMAGELIST g_himlSmall = NULL, g_himlLarge = NULL;
 static int  g_iconPos = 0;          /* 异步填充进度 */
 static int  g_viewMode = 0;         /* 0=列表 1=图标 */
-typedef struct { WCHAR key[80]; int idx; } ICC;
+typedef struct { WCHAR key[80]; int idx; BYTE *p16; BYTE *p32; } ICC;
 static ICC  g_icc[1024];
 static int  g_iccN = 0;
+static int  g_noCache = 0;         /* 配置里写 #NOCACHE=1 可关掉磁盘图标缓存 */
+static int  g_cacheLoaded = 0, g_cacheSaved = 0, g_cacheDirty = 0;
+static int  g_cacheHit = 0, g_cacheMiss = 0;
+static int  g_checkPos = 0, g_checking = 0;     /* 文件是否存在的分块检查进度 */
+static const char CACHE_SIG[12] = { 'Q','L','I','C','O','N','C','A','C','H','E','1' };
 
 /* ---------- 工具函数 ---------- */
 static void join_path(WCHAR *out, size_t cap, const WCHAR *dir, const WCHAR *rel)
@@ -197,12 +206,126 @@ static int icc_get(const WCHAR *k)
     for (int i = 0; i < g_iccN; i++) if (!_wcsicmp(g_icc[i].key, k)) return g_icc[i].idx;
     return -1;
 }
-static void icc_put(const WCHAR *k, int idx)
+static void add_blank(HIMAGELIST h, int size);   /* 前向声明：缓存建图标时用来补齐索引 */
+static void icc_put(const WCHAR *k, int idx, BYTE *p16, BYTE *p32)
 {
-    if (g_iccN >= 1024) return;
+    if (g_iccN >= 1024) {
+        free(p16); free(p32);
+        return;
+    }
     copy_field(g_icc[g_iccN].key, 80, k, wcslen(k));
     g_icc[g_iccN].idx = idx;
+    g_icc[g_iccN].p16 = p16;
+    g_icc[g_iccN].p32 = p32;
     g_iccN++;
+}
+
+/* ---------- 图标 <-> 像素（磁盘缓存用） ---------- */
+/* 取图标的 32 位 BGRA 像素（自上而下）。
+   · 有 alpha 通道的图标直接用；
+   · 老式图标没有 alpha：用 AND 掩码补（掩码位=1 → 透明），否则重建后背景会变黑。
+   返回的 buffer 交给调用方 free()。 */
+static BYTE *icon_to_pixels(HICON ic, int size, int *valid)
+{
+    ICONINFO ii;
+    BITMAPINFO bi;
+    HDC dc;
+    BYTE *buf = NULL, *msk = NULL;
+    int i, anyA = 0;
+    *valid = 0;
+    ZeroMemory(&ii, sizeof(ii));
+    if (!GetIconInfo(ic, &ii)) return NULL;
+    dc = CreateCompatibleDC(NULL);
+    if (!dc) { if (ii.hbmColor) DeleteObject(ii.hbmColor); if (ii.hbmMask) DeleteObject(ii.hbmMask); return NULL; }
+    buf = (BYTE *)malloc((size_t)size * size * 4);
+    if (buf) {
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = size;
+        bi.bmiHeader.biHeight = -size;           /* 自上而下 */
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        if (!GetDIBits(dc, ii.hbmColor, 0, size, buf, &bi, DIB_RGB_COLORS)) { free(buf); buf = NULL; }
+    }
+    if (buf) {
+        int stride = ((size + 31) / 32) * 4;
+        msk = (BYTE *)malloc((size_t)stride * size);
+        if (msk) {
+            ZeroMemory(&bi, sizeof(bi));
+            bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bi.bmiHeader.biWidth = size;
+            bi.bmiHeader.biHeight = size;        /* 1bpp 掩码按自下而上存放 */
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 1;
+            bi.bmiHeader.biCompression = BI_RGB;
+            if (!GetDIBits(dc, ii.hbmMask, 0, size, msk, &bi, DIB_RGB_COLORS)) { free(msk); msk = NULL; }
+        }
+        for (i = 3; i < size * size * 4; i += 4) if (buf[i]) { anyA = 1; break; }
+        if (!anyA) {                              /* 无 alpha → 用掩码合成 */
+            for (i = 0; i < size * size; i++) {
+                int y = i / size, x = i % size;   /* y: 自上而下 */
+                int brow = msk ? (size - 1 - y) : -1;
+                int transparent = 0;
+                if (brow >= 0) {
+                    const BYTE *row = msk + (size_t)brow * stride;
+                    if (row[x >> 3] & (0x80 >> (x & 7))) transparent = 1;
+                }
+                buf[i * 4 + 3] = transparent ? 0 : 255;
+            }
+        }
+        *valid = 1;
+    }
+    free(msk);
+    DeleteDC(dc);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+    return buf;
+}
+static HICON pixels_to_icon(const BYTE *px, int size)
+{
+    BITMAPINFO bi;
+    HDC dc;
+    HBITMAP hbm, hmsk;
+    ICONINFO ii;
+    HICON ic = NULL;
+    void *bits = NULL;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    dc = CreateCompatibleDC(NULL);
+    if (!dc) return NULL;
+    hbm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    DeleteDC(dc);
+    if (!hbm || !bits) { if (hbm) DeleteObject(hbm); return NULL; }
+    memcpy(bits, px, (size_t)size * size * 4);
+    hmsk = CreateBitmap(size, size, 1, 1, NULL);
+    ZeroMemory(&ii, sizeof(ii));
+    ii.fIcon = TRUE;
+    ii.hbmColor = hbm;
+    ii.hbmMask = hmsk;
+    ic = CreateIconIndirect(&ii);
+    DeleteObject(hbm);
+    if (hmsk) DeleteObject(hmsk);
+    return ic;
+}
+/* 从缓存像素建图标并进 ImageList（与 icon_add_both 的索引配对规则一致） */
+static void icc_add_cached(const WCHAR *key, BYTE *p16, BYTE *p32)
+{
+    HICON hs = pixels_to_icon(p16, 16), hl = pixels_to_icon(p32, 32);
+    int idx = -1;
+    if (hs) { idx = ImageList_AddIcon(g_himlSmall, hs); DestroyIcon(hs); }
+    if (hl) {
+        if (idx >= 0) { int pad = 0; while (ImageList_GetImageCount(g_himlLarge) < idx && pad++ < 64) add_blank(g_himlLarge, 32); }
+        if (ImageList_AddIcon(g_himlLarge, hl) < 0) add_blank(g_himlLarge, 32);
+        DestroyIcon(hl);
+    }
+    if (idx >= 0) { icc_put(key, idx, p16, p32); return; }
+    free(p16); free(p32);
 }
 static void add_blank(HIMAGELIST h, int size)
 {
@@ -223,19 +346,39 @@ static int icon_add_both(const WCHAR *path, DWORD attr, int useAttr, const WCHAR
 {
     SHFILEINFOW sfi;
     HICON hs = NULL, hl = NULL;
+    BYTE *px16 = NULL, *px32 = NULL;
+    int v16 = 0, v32 = 0, idxLarge = -1;
     DWORD fl = SHGFI_ICON | (useAttr ? SHGFI_USEFILEATTRIBUTES : 0);
     int idx = -1;
     ZeroMemory(&sfi, sizeof(sfi));
     if (SHGetFileInfoW(path, attr, &sfi, sizeof(sfi), fl | SHGFI_SMALLICON) && sfi.hIcon) hs = sfi.hIcon;
     ZeroMemory(&sfi, sizeof(sfi));
     if (SHGetFileInfoW(path, attr, &sfi, sizeof(sfi), fl | SHGFI_LARGEICON) && sfi.hIcon) hl = sfi.hIcon;
-    if (hs) { idx = ImageList_AddIcon(g_himlSmall, hs); DestroyIcon(hs); }
+    if (hs) {
+        idx = ImageList_AddIcon(g_himlSmall, hs);
+        DestroyIcon(hs);
+    }
     if (hl) {
-        if (idx >= 0) while (ImageList_GetImageCount(g_himlLarge) < idx) add_blank(g_himlLarge, 32);
-        if (ImageList_AddIcon(g_himlLarge, hl) < 0) add_blank(g_himlLarge, 32);
+        if (idx >= 0) { int pad = 0; while (ImageList_GetImageCount(g_himlLarge) < idx && pad++ < 64) add_blank(g_himlLarge, 32); }
+        idxLarge = ImageList_AddIcon(g_himlLarge, hl);
+        if (idxLarge < 0) { add_blank(g_himlLarge, 32); idxLarge = ImageList_GetImageCount(g_himlLarge) - 1; }
         DestroyIcon(hl);
     }
-    if (idx >= 0) icc_put(key, idx);
+    if (idx >= 0) {
+        /* 像素从 ImageList 里的副本取（不碰 shell 给的 HICON，避免影响图标本身）；
+           只缓存"按整个文件取"的真实图标——按扩展名的通用图标重取很便宜，不值得冒险 */
+        if (!useAttr && idxLarge == idx) {
+            HICON h16 = ImageList_GetIcon(g_himlSmall, idx, ILD_NORMAL);
+            HICON h32 = ImageList_GetIcon(g_himlLarge, idx, ILD_NORMAL);
+            if (h16) { px16 = icon_to_pixels(h16, 16, &v16); DestroyIcon(h16); }
+            if (h32) { px32 = icon_to_pixels(h32, 32, &v32); DestroyIcon(h32); }
+        }
+        {
+            int ok = (v16 && v32 && px16 && px32);
+            icc_put(key, idx, ok ? px16 : NULL, ok ? px32 : NULL);
+            if (ok) g_cacheDirty = 1; else { free(px16); free(px32); }
+        }
+    } else { free(px16); free(px32); }
     return idx;
 }
 static int icon_cached(const WCHAR *path, DWORD attr, int useAttr, const WCHAR *key)
@@ -245,6 +388,80 @@ static int icon_cached(const WCHAR *path, DWORD attr, int useAttr, const WCHAR *
     idx = icon_add_both(path, attr, useAttr, key);
     return idx < 0 ? 0 : idx;
 }
+/* ---------- 磁盘图标缓存（icon_cache.dat，放在 exe 同目录） ---------- */
+static void cache_path(WCHAR *out, size_t cap)
+{
+    join_path(out, cap, g_root, L"icon_cache.dat");
+}
+static void cache_load(void)
+{
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    DWORD sz, got, n = 0, i;
+    BYTE *buf, *p, *end;
+    if (g_noCache || g_cacheLoaded) return;
+    g_cacheLoaded = 1;
+    cache_path(path, MAX_PATH * 2);
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    sz = GetFileSize(h, NULL);
+    if (sz == INVALID_FILE_SIZE || sz < 16 || sz > 64u * 1024 * 1024) { CloseHandle(h); return; }
+    buf = (BYTE *)malloc(sz);
+    if (!buf) { CloseHandle(h); return; }
+    if (!ReadFile(h, buf, sz, &got, NULL)) { free(buf); CloseHandle(h); return; }
+    CloseHandle(h);
+    p = buf; end = buf + got;
+    if (memcmp(p, CACHE_SIG, 12)) { free(buf); return; }
+    p += 12;
+    memcpy(&n, p, 4); p += 4;
+    for (i = 0; i < n; i++) {
+        WORD kl = 0;
+        WCHAR key[80];
+        BYTE *p16, *p32;
+        if (p + 2 > end) break;
+        memcpy(&kl, p, 2); p += 2;
+        if (kl == 0 || kl > 79 || p + (size_t)kl * 2 + PX16 + PX32 > end) break;
+        memcpy(key, p, kl * 2); key[kl] = 0; p += (size_t)kl * 2;
+        if (icc_get(key) >= 0) { p += PX16 + PX32; continue; }
+        p16 = (BYTE *)malloc(PX16);
+        p32 = (BYTE *)malloc(PX32);
+        if (!p16 || !p32) { free(p16); free(p32); break; }
+        memcpy(p16, p, PX16); p += PX16;
+        memcpy(p32, p, PX32); p += PX32;
+        icc_add_cached(key, p16, p32);
+    }
+    free(buf);
+}
+static void cache_save(void)
+{
+    WCHAR path[MAX_PATH * 2];
+    HANDLE h;
+    DWORD wr, n = 0;
+    int i;
+    if (g_noCache || g_cacheSaved) return;
+    g_cacheSaved = 1;
+    if (!g_cacheDirty || !g_himlSmall || !g_iccN) return;
+    cache_path(path, MAX_PATH * 2);
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, CACHE_SIG, 12, &wr, NULL);
+    WriteFile(h, &n, 4, &wr, NULL);                 /* 先占位，最后回填条数 */
+    for (i = 0; i < g_iccN; i++) {
+        WORD kl;
+        if (!g_icc[i].p16 || !g_icc[i].p32) continue;
+        kl = (WORD)wcslen(g_icc[i].key);
+        if (!kl || kl > 79) continue;
+        WriteFile(h, &kl, 2, &wr, NULL);
+        WriteFile(h, g_icc[i].key, kl * 2, &wr, NULL);
+        WriteFile(h, g_icc[i].p16, PX16, &wr, NULL);
+        WriteFile(h, g_icc[i].p32, PX32, &wr, NULL);
+        n++;
+    }
+    SetFilePointer(h, 12, NULL, FILE_BEGIN);
+    WriteFile(h, &n, 4, &wr, NULL);
+    CloseHandle(h);
+}
+
 /* 计算某条目图标的缓存键（不做提取，很快） */
 static void icon_key_for(int i, WCHAR *key)
 {
@@ -312,7 +529,6 @@ static void fill_icons_chunk(HWND hwnd)
         }
         g_iconPos++; done++;
     }
-    if (g_iconPos < g_views) PostMessageW(hwnd, WM_APP_FILLICONS, 0, 0);
 }
 
 /* ---------- 面板统计 ---------- */
@@ -359,6 +575,9 @@ static void load_config(void)
     g_count = 0;
     g_cfgPath[0] = 0;
     g_cfgCP = CP_UTF8;
+    g_noCache = 0;
+    g_checkPos = 0;
+    g_checking = 0;
     header_reset();
 
     join_path(path, MAX_PATH * 2, g_root, L"tools_utf8.txt");
@@ -389,6 +608,10 @@ static void load_config(void)
                 WCHAR *v = line + 7;
                 while (*v == L' ' || *v == L'\t') v++;
                 copy_field(g_appTitle, 128, v, wcslen(v));
+            } else if (!_wcsnicmp(line, L"#NOCACHE=", 9)) {
+                WCHAR *v = line + 9;
+                while (*v == L' ' || *v == L'\t') v++;
+                g_noCache = (*v == L'1' || *v == L'y' || *v == L'Y' || *v == L'是') ? 1 : 0;
             } else if (!_wcsnicmp(line, L"#VIEW=", 6)) {
                 WCHAR *v = line + 6;
                 while (*v == L' ' || *v == L'\t') v++;
@@ -413,7 +636,7 @@ static void load_config(void)
         copy_field(it->rel,   1024, f[2], wcslen(f[2]));
         copy_field(it->args,  512,  f[3], wcslen(f[3]));
         join_path(it->full, 2048, g_root, it->rel);
-        it->missing = (GetFileAttributesW(it->full) == INVALID_FILE_ATTRIBUTES);
+        it->missing = 0;     /* 文件是否缺失改到窗口显示之后分块检查，不再卡首屏 */
         g_count++;
     }
     free(text);
@@ -505,11 +728,58 @@ static void set_status(void)
 {
     int miss = 0;
     for (int i = 0; i < g_views; i++) if (g_items[g_view[i]].missing) miss++;
-    WCHAR s[320];
-    _snwprintf(s, 319, L"显示 %d / 共 %d 项   缺失 %d 项   |   双击或回车启动；右键更多操作；「＋添加工具」或把文件拖进窗口即可新增",
-               g_views, g_count, miss);
-    s[319] = 0;
+    WCHAR s[360];
+    if (g_checking)
+        _snwprintf(s, 359, L"显示 %d / 共 %d 项   |   正在后台检查文件是否存在…（%d / %d）",
+                   g_views, g_count, g_checkPos, g_count);
+    else
+        _snwprintf(s, 359, L"显示 %d / 共 %d 项   缺失 %d 项   |   双击或回车启动；右键更多操作；「＋添加工具」或把文件拖进窗口即可新增",
+                   g_views, g_count, miss);
+    s[359] = 0;
     SetWindowTextW(g_hStatus, s);
+}
+
+/* 单行文本刷新（后台检查出结果后即时变红） */
+static void update_row_text(int row)
+{
+    WCHAR nm[300];
+    int i;
+    LVITEMW lv;
+    if (row < 0 || row >= g_views) return;
+    i = g_view[row];
+    if (g_items[i].missing) _snwprintf(nm, 299, L"%s   [文件缺失]", g_items[i].title);
+    else                    _snwprintf(nm, 299, L"%s", g_items[i].title);
+    nm[299] = 0;
+    ZeroMemory(&lv, sizeof(lv));
+    lv.mask = LVIF_TEXT;
+    lv.iItem = row;
+    lv.iSubItem = 0;
+    lv.pszText = nm;
+    SendMessageW(g_hList, LVM_SETITEMW, 0, (LPARAM)&lv);
+}
+
+/* 分块检查文件是否存在：每帧只查 CHECK_CHUNK 条，窗口不会卡 */
+static void check_files_chunk(HWND hwnd)
+{
+    int done = 0;
+    if (!g_checking) { g_checking = 1; }
+    while (g_checkPos < g_count && done < CHECK_CHUNK) {
+        ITEM *it = &g_items[g_checkPos];
+        it->missing = (GetFileAttributesW(it->full) == INVALID_FILE_ATTRIBUTES);
+        for (int r = 0; r < g_views; r++)
+            if (g_view[r] == g_checkPos) { update_row_text(r); break; }
+        g_checkPos++;
+        done++;
+    }
+    if (g_checkPos >= g_count) { g_checking = 0; }
+}
+/* CLI 模式用：一次性查完 */
+static void check_all_files(void)
+{
+    for (int i = 0; i < g_count; i++)
+        g_items[i].missing = (GetFileAttributesW(g_items[i].full) == INVALID_FILE_ATTRIBUTES);
+    g_checkPos = g_count;
+    g_checking = 0;
 }
 
 static void refresh_list(void)
@@ -543,7 +813,7 @@ static void refresh_list(void)
     }
     set_status();
     g_iconPos = 0;
-    if (g_himlSmall) PostMessageW(g_hMain, WM_APP_FILLICONS, 0, 0);
+    if (g_himlSmall) PostMessageW(g_hMain, WM_APP_STEP, 0, 0);
 }
 
 static int selected_item(void)
@@ -1210,6 +1480,7 @@ static void create_children(HWND hwnd)
 static void reload_all(void)
 {
     load_config();
+    cache_load();                      /* 磁盘图标缓存：命中项首屏直接就有图标 */
     fill_panels();
     SetWindowTextW(g_hSearch, L"");
     refresh_list();
@@ -1249,10 +1520,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_font();
         build_menu(hwnd);
         create_children(hwnd);
-        reload_all();
         layout(hwnd);
-        if (g_viewPref) set_view(1);
+        SetWindowTextW(hwnd, APP_NAME);
         DragAcceptFiles(hwnd, TRUE);
+        /* 先把窗口显示出来：配置解析、图标、文件检查全部排在窗口出现之后（点开即见界面） */
+        PostMessageW(hwnd, WM_APP_LOAD, 0, 0);
         return 0;
 
     case WM_SIZE: layout(hwnd); return 0;
@@ -1391,11 +1663,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetBkMode((HDC)wp, TRANSPARENT);
         return (LRESULT)g_hBg;
 
-    case WM_APP_FILLICONS:
-        fill_icons_chunk(hwnd);
+    case WM_APP_LOAD:
+        reload_all();
+        if (g_viewPref && g_viewMode == 0) set_view(1);
+        layout(hwnd);
+        InvalidateRect(g_hList, NULL, FALSE);
+        UpdateWindow(g_hList);              /* 先出一屏内容，再开始后台补图标 */
+        UpdateWindow(g_hStatus);
         return 0;
 
+    case WM_APP_STEP: {                 /* 一小步后台工作 + 强制重绘，保证界面不卡死 */
+        int more = 0;
+        if (g_checkPos < g_count) { check_files_chunk(hwnd); more = 1; }
+        if (g_iconPos < g_views)  { fill_icons_chunk(hwnd);  more = 1; }
+        UpdateWindow(g_hList);                       /* 关键：把列表画出来，别让重绘被消息洪水饿死 */
+        set_status();
+        UpdateWindow(g_hStatus);
+        if (g_checkPos < g_count || g_iconPos < g_views) {
+            PostMessageW(hwnd, WM_APP_STEP, 0, 0);
+        } else {
+            cache_save();                            /* 图标全就位 → 落盘缓存 */
+            InvalidateRect(g_hList, NULL, FALSE);
+            UpdateWindow(g_hList);
+        }
+        (void)more;
+        return 0;
+    }
+
     case WM_DESTROY:
+        cache_save();                       /* 万一图标还没填完就退出，也把已有的存下来 */
         PostQuitMessage(0);
         return 0;
     }
@@ -1472,11 +1768,15 @@ static void bench(const WCHAR *outfile)
     LARGE_INTEGER fq, t0, t1, t2, t3, t4;
     static WCHAR rep[8192];
     int n = 0, ic = 0;
-    double ms1, ms2, ms3, ms4;
+    double ms1, ms2, ms3, ms4, msCheck;
+    LARGE_INTEGER tc;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
     load_config();
     QueryPerformanceCounter(&t1);
+    check_all_files();
+    QueryPerformanceCounter(&tc);
+    msCheck = (double)(tc.QuadPart - t1.QuadPart) * 1000.0 / fq.QuadPart;
     for (int k = 0; k < 1000; k++)
         for (int i = 0; i < g_count; i++) item_match(i, L"exe");
     QueryPerformanceCounter(&t2);
@@ -1496,12 +1796,54 @@ static void bench(const WCHAR *outfile)
     ms4 = (double)(t4.QuadPart - t3.QuadPart) * 1000.0 / fq.QuadPart;
     n += _snwprintf(rep, ARRAYSIZE(rep), L"[--bench] 条目=%d 面板=%d 根目录=%s\r\n", g_count, g_panelN, g_root);
     n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n,
-        L"1) 读配置+拼路径+缺失检测        : %.2f ms\r\n"
+        L"1) 读配置+拼路径（不含文件检查）  : %.2f ms\r\n"
+        L"1b) 全量检查文件是否存在          : %.2f ms（界面上这两步都在窗口出现之后分块做）\r\n"
         L"2) 搜索过滤 1000 轮(共%d条)      : %.2f ms  → 单轮 %.3f ms\r\n"
         L"3) 图标缓存键 200 轮             : %.2f ms\r\n"
         L"4) 首次提取图标 %d 个             : %.2f ms  → 平均 %.2f ms/个(之后命中缓存)\r\n"
         L"5) 图标去重后实际种类             : %d\r\n",
-        ms1, g_count * 1000, ms2, ms2 / 1000.0, ms3, ic, ms4, ic ? ms4 / ic : 0.0, g_iccN);
+        ms1, msCheck, g_count * 1000, ms2, ms2 / 1000.0, ms3, ic, ms4, ic ? ms4 / ic : 0.0, g_iccN);
+    write_report(outfile, rep);
+}
+
+/* 图标缓存专项：--icons 报告文件（冷/热各跑一次对比） */
+static void icon_bench(const WCHAR *outfile)
+{
+    LARGE_INTEGER fq, t0, t1, t2, t3;
+    static WCHAR rep[4096];
+    double msLoad, msFill;
+    int i, itemHit = 0, itemMiss = 0, cacheN = 0, t0ms = GetTickCount();
+    QueryPerformanceFrequency(&fq);
+    load_config();
+    check_all_files();
+    init_image_lists();
+    QueryPerformanceCounter(&t0);
+    cache_load();
+    QueryPerformanceCounter(&t1);
+    cacheN = g_iccN;
+    QueryPerformanceCounter(&t2);
+    for (i = 0; i < g_count; i++) {
+        WCHAR k[80];
+        icon_key_for(i, k);
+        if (icc_get(k) >= 0) { itemHit++; continue; }
+        icon_for_item(i);
+        itemMiss++;
+    }
+    QueryPerformanceCounter(&t3);
+    msLoad = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
+    msFill = (double)(t3.QuadPart - t2.QuadPart) * 1000.0 / fq.QuadPart;
+    cache_save();
+    _snwprintf(rep, ARRAYSIZE(rep) - 1,
+        L"[--icons] 条目=%d  缓存文件里的图标数=%d\r\n"
+        L"缓存命中（直接建图标，零磁盘/Shell 调用）= %d 条\r\n"
+        L"需要重新提取                              = %d 条\r\n"
+        L"读缓存+建图标耗时 = %.2f ms\r\n"
+        L"提取未命中图标耗时 = %.2f ms%s\r\n"
+        L"整体（含配置解析/文件检查）= %d ms，根目录=%s\r\n",
+        g_count, cacheN > 0 ? cacheN - 1 : 0, itemHit, itemMiss, msLoad, msFill,
+        itemMiss ? L"" : L"（全部命中，没有做任何图标提取）", (int)(GetTickCount() - t0ms), g_root);
+
+    rep[ARRAYSIZE(rep) - 1] = 0;
     write_report(outfile, rep);
 }
 
@@ -1546,6 +1888,12 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
     int argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     WCHAR out[MAX_PATH * 2] = L"", kw[128] = L"";
+    if (argc > 1 && (!_wcsicmp(argv[1], L"--icons") || !_wcsicmp(argv[1], L"-icons"))) {
+        if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
+        icon_bench(out);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
     if (argc > 1 && !_wcsicmp(argv[1], L"--additem")) {
         if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
         cli_additem(argc > 2 ? argv[2] : L"", out);
@@ -1563,6 +1911,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
         /* 排障用：不开窗口，直接走界面同样的启动逻辑启动第 N 条（0 开始）*/
         int n = (argc > 2) ? _wtoi(argv[2]) : 0;
         load_config();
+        check_all_files();
         if (n >= 0 && n < g_count) do_launch(n, 0);
         if (argv) LocalFree(argv);
         return 0;
@@ -1578,6 +1927,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
             if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
             if (argc > 3) wcsncpy(kw, argv[3], 127);
             load_config();
+            check_all_files();
             selftest(out, kw);
             if (argv) LocalFree(argv);
             return 0;
