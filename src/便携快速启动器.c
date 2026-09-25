@@ -27,9 +27,11 @@
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.3"
+#define APP_VER     L"1.4"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
+#define SYSPANEL_NAME L"系统面板"        /* 内置面板名（配置里 #SYSPANEL=0 可隐藏） */
+#define BI_MAX      64                   /* 内置系统面板条目上限 */
 
 #define IDC_SEARCH  1001
 #define IDC_PANEL   1002
@@ -54,6 +56,8 @@
 #define IDM_SCAN    2023
 #define IDM_VIEW_LIST 2100
 #define IDM_VIEW_ICON 2101
+#define IDM_GOSYS     2110               /* 跳到内置“系统面板” */
+#define IDM_BI_FIRST  4000               /* 系统菜单里内置条目的命令 ID = IDM_BI_FIRST + 序号 */
 #define WM_APP_LOAD      (WM_APP + 10)
 #define WM_APP_STEP      (WM_APP + 11)   /* 后台小步：先查文件、再填图标，然后强制重绘 */
 #define ICON_CHUNK 16
@@ -82,6 +86,7 @@ typedef struct {
     WCHAR args[512];
     WCHAR full[2048];
     int   missing;
+    int   bi;            /* >0 = 内置“系统面板”条目（序号+1），不写回配置 */
 } ITEM;
 
 static ITEM  g_items[MAX_ITEMS];
@@ -118,6 +123,75 @@ static int  g_cacheLoaded = 0, g_cacheSaved = 0, g_cacheDirty = 0;
 static int  g_cacheHit = 0, g_cacheMiss = 0;
 static int  g_checkPos = 0, g_checking = 0;     /* 文件是否存在的分块检查进度 */
 static const char CACHE_SIG[12] = { 'Q','L','I','C','O','N','C','A','C','H','E','1' };
+
+/* ---------- 内置“系统面板”表 ----------
+   面板里固定提供一批 Windows 自带系统/运维常用入口（快捷方式，不采集任何数据）。
+   group=分组（列表第二列显示，也是「系统」菜单的子菜单名）
+   target=可直接给 ShellExecute 的目标：裸文件名(自动补 System32)/绝对路径/URI/shell: 路径
+   args=启动参数   icon=取图标与查在不在用的文件（留空=同 target）        */
+typedef struct { const WCHAR *group; const WCHAR *title; const WCHAR *target; const WCHAR *args; const WCHAR *icon; } BI;
+static const BI g_bi[] = {
+    /* 主机信息 */
+    { L"主机信息", L"系统信息",              L"msinfo32.exe",   L"", L"" },
+    { L"主机信息", L"计算机管理",            L"compmgmt.msc",   L"", L"" },
+    { L"主机信息", L"设备管理器",            L"devmgmt.msc",    L"", L"" },
+    { L"主机信息", L"磁盘管理",              L"diskmgmt.msc",   L"", L"" },
+    { L"主机信息", L"系统属性",              L"sysdm.cpl",      L"", L"" },
+    { L"主机信息", L"控制面板",              L"control.exe",    L"", L"" },
+    { L"主机信息", L"程序和功能（卸载程序）", L"appwiz.cpl",     L"", L"" },
+    { L"主机信息", L"日期和时间",            L"timedate.cpl",   L"", L"" },
+    { L"主机信息", L"关于本机（设置）",       L"ms-settings:about", L"", L"systeminfo.exe" },
+    { L"主机信息", L"已安装的更新",          L"ms-settings:windowsupdate-history", L"", L"wusa.exe" },
+    /* 网络与共享 */
+    { L"网络与共享", L"网络连接（网卡）",     L"ncpa.cpl",       L"", L"" },
+    { L"网络与共享", L"网络和共享中心",       L"control.exe",    L"/name Microsoft.NetworkAndSharingCenter", L"control.exe" },
+    { L"网络与共享", L"网络设置",            L"ms-settings:network", L"", L"ncpa.cpl" },
+    { L"网络与共享", L"代理设置",            L"ms-settings:network-proxy", L"", L"inetcpl.cpl" },
+    { L"网络与共享", L"Internet 选项",       L"inetcpl.cpl",    L"", L"" },
+    { L"网络与共享", L"本机 IP/网卡信息",     L"cmd.exe",        L"/k ipconfig /all", L"cmd.exe" },
+    { L"网络与共享", L"Windows 防火墙",      L"firewall.cpl",   L"", L"" },
+    { L"网络与共享", L"防火墙高级安全",       L"wf.msc",         L"", L"" },
+    { L"网络与共享", L"共享文件夹",          L"fsmgmt.msc",     L"", L"" },
+    { L"网络与共享", L"hosts 文件（记事本）", L"notepad.exe",    L"C:\\Windows\\System32\\drivers\\etc\\hosts", L"notepad.exe" },
+    { L"网络与共享", L"网络状态（资源监视器）", L"resmon.exe",   L"", L"" },
+    /* 运行状态 */
+    { L"运行状态", L"任务管理器",            L"taskmgr.exe",    L"", L"" },
+    { L"运行状态", L"服务",                  L"services.msc",   L"", L"" },
+    { L"运行状态", L"资源监视器",            L"resmon.exe",     L"", L"" },
+    { L"运行状态", L"性能监视器",            L"perfmon.msc",    L"", L"" },
+    { L"运行状态", L"计划任务",              L"taskschd.msc",   L"", L"" },
+    { L"运行状态", L"系统配置（启动项）",     L"msconfig.exe",   L"", L"" },
+    { L"运行状态", L"本地组策略（专业版）",   L"gpedit.msc",     L"", L"" },
+    /* 日志与痕迹 */
+    { L"日志与痕迹", L"事件查看器",          L"eventvwr.msc",   L"", L"" },
+    { L"日志与痕迹", L"最近使用的文档",       L"shell:recent",   L"", L"shell32.dll" },
+    { L"日志与痕迹", L"下载文件夹",          L"shell:Downloads", L"", L"shell32.dll" },
+    { L"日志与痕迹", L"回收站",              L"shell:RecycleBinFolder", L"", L"shell32.dll" },
+    { L"日志与痕迹", L"本地用户和组",         L"lusrmgr.msc",    L"", L"" },
+    { L"日志与痕迹", L"用户账户设置",         L"netplwiz.exe",   L"", L"" },
+    { L"日志与痕迹", L"注册表编辑器",         L"regedit.exe",    L"", L"" },
+    { L"日志与痕迹", L"证书管理器",          L"certmgr.msc",    L"", L"" },
+    { L"日志与痕迹", L"系统还原",            L"rstrui.exe",     L"", L"" },
+    { L"日志与痕迹", L"Windows 安全中心",     L"windowsdefender:", L"", L"wscui.cpl" },
+    { L"日志与痕迹", L"设备与打印机",         L"control.exe",    L"/name Microsoft.DevicesAndPrinters", L"control.exe" },
+    /* 外设与截图 */
+    { L"外设与截图", L"截图工具",            L"snippingtool.exe", L"", L"" },
+    { L"外设与截图", L"新建截图（Snip & Sketch）", L"ms-screenclip:", L"", L"snippingtool.exe" },
+    { L"外设与截图", L"屏幕键盘",            L"osk.exe",        L"", L"" },
+    { L"外设与截图", L"放大镜",              L"magnify.exe",    L"", L"" },
+    { L"外设与截图", L"画图",                L"mspaint.exe",    L"", L"" },
+    { L"外设与截图", L"计算器",              L"calc.exe",       L"", L"" },
+    { L"外设与截图", L"记事本",              L"notepad.exe",    L"", L"" },
+    /* 常用命令 */
+    { L"常用命令",  L"命令提示符",            L"cmd.exe",        L"", L"" },
+    { L"常用命令",  L"PowerShell",           L"powershell.exe", L"", L"" },
+    { L"常用命令",  L"磁盘清理",              L"cleanmgr.exe",   L"", L"" }
+};
+static int   g_biN = 0;                       /* 内置条目数 */
+static int   g_sysPanel = 1;                  /* 配置 #SYSPANEL=0 可隐藏内置面板 */
+static int   g_biIdx[BI_MAX];                 /* 内置条目 → g_items 下标（未启用时为 -1） */
+static WCHAR g_biTarget[BI_MAX][512];         /* 解析后的启动目标 */
+static WCHAR g_biIconP[BI_MAX][512];          /* 取图标 / 查存在性用的文件 */
 
 /* ---------- 工具函数 ---------- */
 static void join_path(WCHAR *out, size_t cap, const WCHAR *dir, const WCHAR *rel)
@@ -165,6 +239,87 @@ static void copy_field(WCHAR *dst, size_t cap, const WCHAR *src, size_t len)
     while (len > 0 && (src[len - 1] == L' ' || src[len - 1] == L'\t' || src[len - 1] == L'\r')) len--;
     if (len >= cap) len = cap - 1;
     wcsncpy(dst, src, len); dst[len] = 0;
+}
+
+/* ---------- 内置“系统面板”条目：目标解析 / 注入 / 启动 ---------- */
+/* 已经是绝对路径或协议(ms-settings:、shell: 等)就不用再解析 */
+static int bi_is_direct(const WCHAR *t)
+{
+    if (!t || !*t) return 0;
+    if (t[0] == L'\\') return 1;
+    if (t[1] == L':' && (t[2] == L'\\' || t[2] == L'/')) return 1;
+    if (wcschr(t, L':')) return 1;
+    return 0;
+}
+/* 裸文件名（wf.msc / control.exe）解析成实际路径；找不到时给出 System32 下的预期路径（界面会标“文件缺失”） */
+static void bi_resolve(const WCHAR *name, WCHAR *out, size_t cap)
+{
+    WCHAR sys[MAX_PATH], cand[2048], fallback[2048];
+    out[0] = 0; fallback[0] = 0;
+    if (!name || !*name) return;
+    if (bi_is_direct(name)) { wcsncpy(out, name, cap - 1); out[cap - 1] = 0; return; }
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {            /* 32 位进程拿到的是 SysWOW64，取不到再试 System32 */
+        join_path(cand, 2048, sys, name);
+        wcsncpy(fallback, cand, 2047); fallback[2047] = 0;
+        if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+            wcsncpy(out, cand, cap - 1); out[cap - 1] = 0; return;
+        }
+    }
+    if (GetWindowsDirectoryW(sys, MAX_PATH)) {
+        WCHAR s32[2048];
+        _snwprintf(s32, 2047, L"%s\\System32", sys); s32[2047] = 0;
+        join_path(cand, 2048, s32, name);
+        if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+            wcsncpy(out, cand, cap - 1); out[cap - 1] = 0; return;
+        }
+    }
+    wcsncpy(out, fallback, cap - 1); out[cap - 1] = 0;
+}
+/* 把内置表注入条目列表（#SYSPANEL=0 时只解析不注入，菜单仍可用） */
+static void inject_builtin(void)
+{
+    int n = (int)(sizeof(g_bi) / sizeof(g_bi[0]));
+    if (n > BI_MAX) n = BI_MAX;
+    g_biN = n;
+    for (int i = 0; i < n; i++) {
+        g_biIdx[i] = -1;
+        bi_resolve(g_bi[i].target, g_biTarget[i], 512);
+        bi_resolve(g_bi[i].icon[0] ? g_bi[i].icon : g_bi[i].target, g_biIconP[i], 512);
+    }
+    if (!g_sysPanel) return;
+    for (int i = 0; i < n && g_count < MAX_ITEMS; i++) {
+        ITEM *it = &g_items[g_count];
+        copy_field(it->panel, 64,  SYSPANEL_NAME, wcslen(SYSPANEL_NAME));
+        copy_field(it->title, 256, g_bi[i].title, wcslen(g_bi[i].title));
+        copy_field(it->rel,   1024, g_biTarget[i], wcslen(g_biTarget[i]));
+        copy_field(it->args,  512,  g_bi[i].args,  wcslen(g_bi[i].args));
+        copy_field(it->full,  2048, g_biIconP[i],  wcslen(g_biIconP[i]));
+        it->bi = i + 1;
+        it->missing = 0;
+        g_biIdx[i] = g_count;
+        g_count++;
+    }
+}
+static WCHAR *bi_group(int k)
+{
+    if (k < 0 || k >= g_biN) return (WCHAR *)L"";
+    return (WCHAR *)g_bi[k].group;
+}
+/* 启动一条内置入口（列表与「系统」菜单共用） */
+static void launch_bi(int k, int runas)
+{
+    HINSTANCE r;
+    WCHAR msg[1400];
+    if (k < 0 || k >= g_biN) return;
+    r = ShellExecuteW(g_hMain, runas ? L"runas" : L"open", g_biTarget[k],
+                      g_bi[k].args[0] ? g_bi[k].args : NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32) {
+        _snwprintf(msg, 1399, L"打开失败（代码 %d）：\n%s %s\n\n"
+                   L"这一项可能只在较新的 Windows 上可用（“设置”类 ms-settings: 需要 Win10 及以上）。",
+                   (int)(INT_PTR)r, g_biTarget[k], g_bi[k].args);
+        msg[1399] = 0;
+        MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONWARNING);
+    }
 }
 
 /* 把绝对路径尽量转成相对工具箱根目录的相对路径 */
@@ -549,6 +704,18 @@ static void build_panels(void)
             copy_field(g_panels[found], 64, g_items[i].panel, wcslen(g_items[i].panel));
         }
     }
+    /* 内置“系统面板”排到最前，左侧列表里紧跟“全部” */
+    for (int j = 0; j < g_panelN; j++) {
+        if (!wcscmp(g_panels[j], SYSPANEL_NAME)) {
+            if (j > 0) {
+                WCHAR tmp[64];
+                wcsncpy(tmp, g_panels[j], 63); tmp[63] = 0;
+                for (int k = j; k > 0; k--) wcsncpy(g_panels[k], g_panels[k - 1], 64);
+                wcsncpy(g_panels[0], tmp, 64);
+            }
+            break;
+        }
+    }
 }
 
 /* ---------- 载入配置 ---------- */
@@ -581,6 +748,7 @@ static void load_config(void)
     g_cfgPath[0] = 0;
     g_cfgCP = CP_UTF8;
     g_noCache = 0;
+    g_sysPanel = 1;
     g_checkPos = 0;
     g_checking = 0;
     header_reset();
@@ -597,6 +765,7 @@ static void load_config(void)
         /* 没有配置文件也不终止：让用户可以直接用界面添加工具，保存时自动创建 */
         join_path(g_cfgPath, MAX_PATH * 2, g_root, L"tools_utf8.txt");
         g_cfgCP = CP_UTF8;
+        inject_builtin();
         build_panels();
         return;
     }
@@ -621,6 +790,10 @@ static void load_config(void)
                 WCHAR *v = line + 6;
                 while (*v == L' ' || *v == L'\t') v++;
                 g_viewPref = (StrStrIW(v, L"icon") || StrStrIW(v, L"图标")) ? 1 : 0;
+            } else if (!_wcsnicmp(line, L"#SYSPANEL=", 10)) {
+                WCHAR *v = line + 10;
+                while (*v == L' ' || *v == L'\t') v++;
+                g_sysPanel = (*v == L'0' || *v == L'n' || *v == L'N' || *v == L'否' || *v == L'关') ? 0 : 1;
             } else if (_wcsnicmp(line, L"# 本文件由", 5) && _wcsnicmp(line, L"# 路径可写相对本程序目录", 12)) {
                 size_t ln = wcslen(line);  /* 去掉行尾 \r 再存，避免回写时多出一个 ^M */
                 while (ln && (line[ln - 1] == L'\r' || line[ln - 1] == L' ' || line[ln - 1] == L'\t')) line[--ln] = 0;
@@ -642,10 +815,12 @@ static void load_config(void)
         copy_field(it->args,  512,  f[3], wcslen(f[3]));
         join_path(it->full, 2048, g_root, it->rel);
         it->missing = 0;     /* 文件是否缺失改到窗口显示之后分块检查，不再卡首屏 */
+        it->bi = 0;
         g_count++;
     }
     free(text);
 
+    inject_builtin();          /* 内置“系统面板”条目追加在配置条目之后 */
     build_panels();
 }
 
@@ -678,6 +853,7 @@ static void write_items(HANDLE h, int onlyVisible)
     for (idx = 0; idx < n; idx++) {
         ITEM *it = &g_items[onlyVisible ? g_view[idx] : idx];
         WCHAR panel[64], title[256], rel[1024], args[512];
+        if (it->bi) continue;               /* 内置“系统面板”条目不进配置文件 */
         wcsncpy(panel, it->panel, 63); panel[63] = 0;
         wcsncpy(title, it->title, 255); title[255] = 0;
         wcsncpy(rel,   it->rel,  1023); rel[1023] = 0;
@@ -724,6 +900,8 @@ static int save_config_ex(const WCHAR *path, UINT cp, int onlyVisible, int backu
     line[4095] = 0;
     write_conv(h, line); write_crlf(h);
     if (g_viewPref) { write_conv(h, L"#VIEW=icon"); write_crlf(h); }
+    if (!g_sysPanel) { write_conv(h, L"#SYSPANEL=0"); write_crlf(h); }
+    if (g_noCache)   { write_conv(h, L"#NOCACHE=1"); write_crlf(h); }
     if (g_header && g_headerLen) write_conv(h, g_header);
     write_items(h, onlyVisible);
     FlushFileBuffers(h);
@@ -830,9 +1008,19 @@ static void refresh_list(void)
         LVITEMW sub;
         ZeroMemory(&sub, sizeof(sub));
         sub.mask = LVIF_TEXT;
-        sub.iItem = row; sub.iSubItem = 1; sub.pszText = g_items[i].rel;
+        sub.iItem = row; sub.iSubItem = 1;
+        sub.pszText = g_items[i].bi ? bi_group(g_items[i].bi - 1) : g_items[i].rel;
         SendMessageW(g_hList, LVM_SETITEMW, 0, (LPARAM)&sub);
         g_view[g_views++] = i;
+    }
+    /* 选中“系统面板”时第二列改叫“分组”，普通面板仍是路径 */
+    {
+        LVCOLUMNW c;
+        ZeroMemory(&c, sizeof(c));
+        c.mask = LVCF_TEXT;
+        c.pszText = (g_panelSel > 0 && !wcscmp(g_panels[g_panelSel - 1], SYSPANEL_NAME))
+                  ? L"分组（系统自带工具）" : L"路径（相对工具箱根目录）";
+        SendMessageW(g_hList, LVM_SETCOLUMNW, 1, (LPARAM)&c);
     }
     set_status();
     g_iconPos = 0;
@@ -877,12 +1065,21 @@ static void open_folder_of(int idx)
 
 static void copy_path_of(int idx)
 {
+    WCHAR buf[2048];
+    size_t n;
     if (idx < 0) return;
-    size_t n = wcslen(g_items[idx].full);
+    if (g_items[idx].bi) {               /* 内置项：复制可直接执行的命令（目标 + 参数） */
+        if (g_items[idx].args[0]) _snwprintf(buf, 2047, L"%s %s", g_items[idx].rel, g_items[idx].args);
+        else                      wcsncpy(buf, g_items[idx].rel, 2047);
+    } else {
+        wcsncpy(buf, g_items[idx].full, 2047);
+    }
+    buf[2047] = 0;
+    n = wcslen(buf);
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(WCHAR));
     if (!h) return;
     void *dst = GlobalLock(h);
-    memcpy(dst, g_items[idx].full, (n + 1) * sizeof(WCHAR));
+    memcpy(dst, buf, (n + 1) * sizeof(WCHAR));
     GlobalUnlock(h);
     if (OpenClipboard(g_hMain)) {
         EmptyClipboard();
@@ -895,6 +1092,10 @@ static void do_launch(int idx, int runas)
 {
     if (idx < 0) return;
     ITEM *it = &g_items[idx];
+    if (it->bi) {                       /* 内置系统面板：目标可能是命令名 / URI / shell: 路径，直接交给 shell */
+        launch_bi(it->bi - 1, runas);
+        return;
+    }
     if (it->missing) {
         WCHAR msg[2400];
         _snwprintf(msg, 2399, L"文件不存在：\n%s\n\n是否打开所在文件夹？", it->full);
@@ -1682,6 +1883,14 @@ static void do_edit_item(void)
 {
     int idx = selected_item();
     if (idx < 0) { MessageBoxW(g_hMain, L"请先在列表里选中一个条目。", APP_NAME, MB_ICONINFORMATION); return; }
+    if (g_items[idx].bi) {
+        MessageBoxW(g_hMain,
+            L"「系统面板」里的是内置系统工具入口（快捷方式），不能编辑或删除。\n\n"
+            L"想自定义自己的工具，请用右上角「＋ 添加工具」。\n"
+            L"想隐藏整个「系统面板」，在 tools_utf8.txt 里加一行 #SYSPANEL=0，再按 F5。",
+            APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
     if (!run_item_dialog(idx, NULL)) return;
     copy_field(g_items[idx].panel, 64,  g_din.panel, wcslen(g_din.panel));
     copy_field(g_items[idx].title, 256, g_din.name,  wcslen(g_din.name));
@@ -1698,6 +1907,13 @@ static void do_del_item(void)
     int idx = selected_item();
     WCHAR msg[600];
     if (idx < 0) { MessageBoxW(g_hMain, L"请先在列表里选中一个条目。", APP_NAME, MB_ICONINFORMATION); return; }
+    if (g_items[idx].bi) {
+        MessageBoxW(g_hMain,
+            L"「系统面板」里的是内置系统工具入口，删不掉。\n\n"
+            L"想隐藏整个「系统面板」，在 tools_utf8.txt 里加一行 #SYSPANEL=0，再按 F5。",
+            APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
     _snwprintf(msg, 599, L"从工具列表中移除：\n\n%s\n（%s）\n\n只删除配置里的条目，不动磁盘上的文件。",
                g_items[idx].title, g_items[idx].rel);
     msg[599] = 0;
@@ -1787,6 +2003,24 @@ static void set_view(int mode)
     InvalidateRect(g_hList, NULL, TRUE);
 }
 
+/* 跳到内置“系统面板”（左侧列表选中它并刷新） */
+static void goto_syspanel(void)
+{
+    for (int j = 0; j < g_panelN; j++) {
+        if (!wcscmp(g_panels[j], SYSPANEL_NAME)) {
+            SendMessageW(g_hPanel, LB_SETCURSEL, j + 1, 0);   /* 索引 0 = 全部 */
+            g_panelSel = j + 1;
+            SetFocus(g_hList);
+            refresh_list();
+            return;
+        }
+    }
+    MessageBoxW(g_hMain,
+        L"「" SYSPANEL_NAME L"」当前未启用（配置里有 #SYSPANEL=0）。\n"
+        L"删掉那一行再按 F5 就能显示。",
+        APP_NAME, MB_ICONINFORMATION);
+}
+
 static void build_menu(HWND hwnd)
 {
     HMENU mb = CreateMenu(), m1 = CreatePopupMenu(), m2 = CreatePopupMenu(), m3 = CreatePopupMenu();
@@ -1812,8 +2046,26 @@ static void build_menu(HWND hwnd)
     AppendMenuW(m3, MF_STRING, IDM_ABOUT,   L"关于(&A)");
     AppendMenuW(m4, MF_STRING, IDM_VIEW_LIST, L"列表视图（带小图标）\tCtrl+1");
     AppendMenuW(m4, MF_STRING, IDM_VIEW_ICON, L"图标视图（大图标）\tCtrl+2");
+    /* 「系统」菜单：内置系统面板的全部入口，按分组做子菜单（不切面板也能一键打开） */
+    HMENU msys = CreatePopupMenu();
+    AppendMenuW(msys, MF_STRING, IDM_GOSYS, L"打开「" SYSPANEL_NAME L"」&G\tCtrl+3");
+    AppendMenuW(msys, MF_SEPARATOR, 0, NULL);
+    {
+        int nbi = (int)(sizeof(g_bi) / sizeof(g_bi[0])), i = 0;
+        if (nbi > BI_MAX) nbi = BI_MAX;
+        while (i < nbi) {
+            int j = i + 1;
+            HMENU g = CreatePopupMenu();
+            while (j < nbi && !wcscmp(g_bi[j].group, g_bi[i].group)) j++;
+            for (int k = i; k < j; k++)
+                AppendMenuW(g, MF_STRING, IDM_BI_FIRST + k, g_bi[k].title);
+            AppendMenuW(msys, MF_POPUP, (UINT_PTR)g, g_bi[i].group);
+            i = j;
+        }
+    }
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)m1, L"文件(&F)");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)m2, L"工具(&T)");
+    AppendMenuW(mb, MF_POPUP, (UINT_PTR)msys, L"系统(&S)");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)m4, L"视图(&V)");
     AppendMenuW(mb, MF_POPUP, (UINT_PTR)m3, L"帮助(&H)");
     SetMenu(hwnd, mb);
@@ -1973,7 +2225,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_panelSel = (s < 0) ? 0 : s;
             refresh_list(); return 0;
         }
+        if (id >= IDM_BI_FIRST && id < IDM_BI_FIRST + BI_MAX) {   /* 「系统」菜单里的内置入口 */
+            launch_bi(id - IDM_BI_FIRST, 0);
+            return 0;
+        }
         switch (id) {
+        case IDM_GOSYS:   goto_syspanel(); return 0;
         case IDM_RUN:     do_launch(selected_item(), 0); return 0;
         case IDM_RUNAS:   do_launch(selected_item(), 1); return 0;
         case IDM_FOLDER:  open_folder_of(selected_item()); return 0;
@@ -2009,7 +2266,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 L"  所以整个工具箱换盘符、换电脑都不会失效\n\n"
                 L"· 文件菜单里还能：新建空配置（清空）/ 导入配置（支持 Rolan 的 cfg、rcb）/\n"
                 L"  从文件夹批量新建（扫描目录里的 exe、bat、ps1 建一个面板）/ 导出配置（另存为 txt）\n\n"
-                L"Ctrl+1 列表视图(带小图标)　·　Ctrl+2 图标视图(大图标)　·　Ctrl+N 添加工具\n"
+                L"· 内置「" SYSPANEL_NAME L"」：一批 Windows 自带的系统管理常用入口（系统信息、网络连接、\n"
+                L"  防火墙、事件查看器、任务管理器、服务、截图工具等），左侧面板里选它即可；\n"
+                L"  顶部「系统」菜单同样能一键打开。这些是内置项，不写进配置文件，也不能删；\n"
+                L"  想整个隐藏，在 tools_utf8.txt 里写一行 #SYSPANEL=0 再按 F5。\n\n"
+                L"Ctrl+1 列表视图(带小图标)　·　Ctrl+2 图标视图(大图标)　·　Ctrl+3 跳到「" SYSPANEL_NAME L"」\n"
+                L"Ctrl+N 添加工具\n"
                 L"F5 重载　·　Esc 清空搜索　·　在 tools_utf8.txt 里写一行 #VIEW=icon 可把大图标视图设为默认。",
                 APP_NAME, MB_ICONINFORMATION);
             return 0;
@@ -2154,8 +2416,8 @@ static void selftest(const WCHAR *outfile, const WCHAR *kw)
         }
         shown++;
     }
-    n += _snwprintf(rep, ARRAYSIZE(rep), L"标题=%s\r\n总条目=%d\r\n面板数=%d\r\n配置文件=%s\r\n",
-                    g_appTitle, g_count, g_panelN, g_cfgPath);
+    n += _snwprintf(rep, ARRAYSIZE(rep), L"标题=%s\r\n总条目=%d\r\n其中内置(%s)=%d\r\n面板数=%d\r\n配置文件=%s\r\n",
+                    g_appTitle, g_count, SYSPANEL_NAME, g_biN, g_panelN, g_cfgPath);
     for (int j = 0; j < g_panelN; j++) {
         int c = 0;
         for (int i = 0; i < g_count; i++) if (!wcscmp(g_items[i].panel, g_panels[j])) c++;
@@ -2169,6 +2431,32 @@ static void selftest(const WCHAR *outfile, const WCHAR *kw)
         n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n, L"示例-末条=%s | %s\r\n",
                         g_items[g_count - 1].title, g_items[g_count - 1].full);
     }
+    write_report(outfile, rep);
+}
+
+/* 内置「系统面板」清单（--syspanel），无图形环境也能核对每一条会打开什么 */
+static void syspanel_report(const WCHAR *outfile)
+{
+    static WCHAR rep[64 * 1024];
+    int n = 0, ok = 0;
+    WCHAR cmd[1400];
+    n += _snwprintf(rep, ARRAYSIZE(rep),
+                    L"内置面板=%s  条目=%d  已启用(#SYSPANEL)=%d  根目录=%s\r\n"
+                    L"格式: 序号|分组|名称|启动目标|参数|图标/检查文件|存在(=1在)|可执行\r\n",
+                    SYSPANEL_NAME, g_biN, g_sysPanel, g_root);
+    for (int i = 0; i < g_biN && n < (int)ARRAYSIZE(rep) - 2048; i++) {
+        int ex = (GetFileAttributesW(g_biIconP[i]) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+        if (ex) ok++;
+        if (g_bi[i].args[0]) _snwprintf(cmd, 1399, L"%s %s", g_biTarget[i], g_bi[i].args);
+        else                 wcsncpy(cmd, g_biTarget[i], 1399);
+        cmd[1399] = 0;
+        n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n, L"%d|%s|%s|%s|%s|%s|%d|%s\r\n",
+                        i, g_bi[i].group, g_bi[i].title, g_biTarget[i], g_bi[i].args,
+                        g_biIconP[i], ex, cmd);
+    }
+    n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n,
+                    L"图标/检查文件存在的条目=%d/%d（不存在的多是本机没有自带或系统版本较低，界面里会标红为“文件缺失”）\r\n",
+                    ok, g_biN);
     write_report(outfile, rep);
 }
 
@@ -2402,6 +2690,13 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
         if (argv) LocalFree(argv);
         return 0;
     }
+    if (argc > 1 && (!_wcsicmp(argv[1], L"--syspanel") || !_wcsicmp(argv[1], L"-syspanel"))) {
+        if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
+        load_config();
+        syspanel_report(out);
+        if (argv) LocalFree(argv);
+        return 0;
+    }
     if (argc > 1 && (!_wcsicmp(argv[1], L"--dump") || !_wcsicmp(argv[1], L"-dump"))) {
         if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
         load_config();
@@ -2461,13 +2756,14 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
-    ACCEL acc[4];
+    ACCEL acc[5];
     HACCEL hac = NULL;
     acc[0].fVirt = FCONTROL | FVIRTKEY; acc[0].key = '1'; acc[0].cmd = IDM_VIEW_LIST;
     acc[1].fVirt = FCONTROL | FVIRTKEY; acc[1].key = '2'; acc[1].cmd = IDM_VIEW_ICON;
     acc[2].fVirt = FVIRTKEY;            acc[2].key = VK_F5; acc[2].cmd = IDM_RELOAD;
     acc[3].fVirt = FCONTROL | FVIRTKEY; acc[3].key = 'N';  acc[3].cmd = IDM_ADD;
-    hac = CreateAcceleratorTableW(acc, 4);
+    acc[4].fVirt = FCONTROL | FVIRTKEY; acc[4].key = '3';  acc[4].cmd = IDM_GOSYS;
+    hac = CreateAcceleratorTableW(acc, 5);
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0) > 0) {

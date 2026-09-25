@@ -1,6 +1,7 @@
 #TITLE=示例工具箱
 # 格式: 面板|名称|相对路径|参数     （路径相对 exe 所在目录；写绝对路径如 C:\Windows\... 也支持）
 # 空行与本文件中的 # 注释行会被忽略；改完在程序里按 F5 刷新，或直接重启。
+# #SYSPANEL=0   ← 想隐藏程序内置的「系统面板」（49 项 Windows 自带入口）就把这一行开头的 “# ” 去掉
 系统工具|记事本|C:\Windows\System32\notepad.exe|
 系统工具|计算器|C:\Windows\System32\calc.exe|
 系统工具|资源监视器|C:\Windows\System32\resmon.exe|
