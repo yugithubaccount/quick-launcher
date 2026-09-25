@@ -27,7 +27,7 @@
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.4"
+#define APP_VER     L"1.5"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
 #define SYSPANEL_NAME L"系统面板"        /* 内置面板名（配置里 #SYSPANEL=0 可隐藏） */
@@ -54,6 +54,11 @@
 #define IDM_IMPORT  2021
 #define IDM_EXPORT  2022
 #define IDM_SCAN    2023
+#define IDM_MOVEPANEL 2013               /* 把选中条目移动到别的面板（弹出选择框） */
+#define IDM_NEWPANEL  2014               /* 新建面板（空面板，配置里以 #PANEL= 记住） */
+#define IDM_RENPANEL  2015               /* 重命名面板 */
+#define IDM_DELPANEL  2016               /* 删除空面板 */
+#define IDM_MOVEHERE  2017               /* 把选中条目移动到左侧右键点到的那个面板 */
 #define IDM_VIEW_LIST 2100
 #define IDM_VIEW_ICON 2101
 #define IDM_GOSYS     2110               /* 跳到内置“系统面板” */
@@ -78,6 +83,13 @@
 #define IDC_DLG_BROWSE 3005
 #define IDC_DLG_OK    3006
 #define IDC_DLG_CANCEL 3007
+
+/* 「输入/选择面板名」小对话框控件 */
+#define IDC_PDLG_LABEL  3201
+#define IDC_PDLG_EDIT   3202
+#define IDC_PDLG_HINT   3203
+#define IDC_PDLG_OK     3204
+#define IDC_PDLG_CANCEL 3205
 
 typedef struct {
     WCHAR panel[64];
@@ -192,6 +204,16 @@ static int   g_sysPanel = 1;                  /* 配置 #SYSPANEL=0 可隐藏内
 static int   g_biIdx[BI_MAX];                 /* 内置条目 → g_items 下标（未启用时为 -1） */
 static WCHAR g_biTarget[BI_MAX][512];         /* 解析后的启动目标 */
 static WCHAR g_biIconP[BI_MAX][512];          /* 取图标 / 查存在性用的文件 */
+
+/* 用户在界面里新建的空面板（配置里以 #PANEL=名称 记住，可以没有任何条目） */
+static WCHAR g_xpanels[MAX_PANELS][64];
+static int   g_xpanelsN = 0;
+static WCHAR g_menuPanel[64] = L"";   /* 左侧面板列表右键点到的面板名（给“移动到此面板”用） */
+/* 「输入/选择面板名」对话框状态 */
+static HWND  g_hPDlg = NULL, g_pdEdit = NULL;
+static int   g_pdOK = 0, g_pdUseCombo = 0;
+static const WCHAR *g_pdLabel = L"", *g_pdHint = L"";
+static WCHAR g_pdOut[64];
 
 /* ---------- 工具函数 ---------- */
 static void join_path(WCHAR *out, size_t cap, const WCHAR *dir, const WCHAR *rel)
@@ -704,6 +726,13 @@ static void build_panels(void)
             copy_field(g_panels[found], 64, g_items[i].panel, wcslen(g_items[i].panel));
         }
     }
+    /* 界面里新建的空面板（可能没有任何条目）也要出现在左侧 */
+    for (int k = 0; k < g_xpanelsN; k++) {
+        int found = 0;
+        for (int j = 0; j < g_panelN; j++) if (!wcscmp(g_panels[j], g_xpanels[k])) { found = 1; break; }
+        if (!found && g_panelN < MAX_PANELS)
+            copy_field(g_panels[g_panelN++], 64, g_xpanels[k], wcslen(g_xpanels[k]));
+    }
     /* 内置“系统面板”排到最前，左侧列表里紧跟“全部” */
     for (int j = 0; j < g_panelN; j++) {
         if (!wcscmp(g_panels[j], SYSPANEL_NAME)) {
@@ -749,6 +778,7 @@ static void load_config(void)
     g_cfgCP = CP_UTF8;
     g_noCache = 0;
     g_sysPanel = 1;
+    g_xpanelsN = 0;
     g_checkPos = 0;
     g_checking = 0;
     header_reset();
@@ -794,6 +824,17 @@ static void load_config(void)
                 WCHAR *v = line + 10;
                 while (*v == L' ' || *v == L'\t') v++;
                 g_sysPanel = (*v == L'0' || *v == L'n' || *v == L'N' || *v == L'否' || *v == L'关') ? 0 : 1;
+            } else if (!_wcsnicmp(line, L"#PANEL=", 7)) {
+                WCHAR *v = line + 7;
+                size_t ln;
+                while (*v == L' ' || *v == L'\t') v++;
+                ln = wcslen(v);
+                while (ln && (v[ln - 1] == L'\r' || v[ln - 1] == L' ' || v[ln - 1] == L'\t')) v[--ln] = 0;
+                if (*v && wcscmp(v, SYSPANEL_NAME) && g_xpanelsN < MAX_PANELS) {
+                    int dup = 0;
+                    for (int k = 0; k < g_xpanelsN; k++) if (!wcscmp(g_xpanels[k], v)) { dup = 1; break; }
+                    if (!dup) { copy_field(g_xpanels[g_xpanelsN], 64, v, wcslen(v)); g_xpanelsN++; }
+                }
             } else if (_wcsnicmp(line, L"# 本文件由", 5) && _wcsnicmp(line, L"# 路径可写相对本程序目录", 12)) {
                 size_t ln = wcslen(line);  /* 去掉行尾 \r 再存，避免回写时多出一个 ^M */
                 while (ln && (line[ln - 1] == L'\r' || line[ln - 1] == L' ' || line[ln - 1] == L'\t')) line[--ln] = 0;
@@ -902,6 +943,11 @@ static int save_config_ex(const WCHAR *path, UINT cp, int onlyVisible, int backu
     if (g_viewPref) { write_conv(h, L"#VIEW=icon"); write_crlf(h); }
     if (!g_sysPanel) { write_conv(h, L"#SYSPANEL=0"); write_crlf(h); }
     if (g_noCache)   { write_conv(h, L"#NOCACHE=1"); write_crlf(h); }
+    for (int k = 0; k < g_xpanelsN; k++) {          /* 界面里新建的空面板：靠这几行记住 */
+        _snwprintf(line, 4095, L"#PANEL=%s", g_xpanels[k]);
+        line[4095] = 0;
+        write_conv(h, line); write_crlf(h);
+    }
     if (g_header && g_headerLen) write_conv(h, g_header);
     write_items(h, onlyVisible);
     FlushFileBuffers(h);
@@ -1024,6 +1070,10 @@ static void refresh_list(void)
     }
     set_status();
     g_iconPos = 0;
+    if (g_viewMode == 1 && g_views > 0) {
+        SendMessageW(g_hList, LVM_ARRANGE, LVA_DEFAULT, 0);      /* 换面板/刷新后重排图标 */
+        InvalidateRect(g_hList, NULL, FALSE);
+    }
     if (g_himlSmall) PostMessageW(g_hMain, WM_APP_STEP, 0, 0);
 }
 
@@ -1981,6 +2031,11 @@ static void layout(HWND hwnd)
     int w2 = W - (pad + leftw + 8) - pad - 300;
     if (w2 < 120) w2 = 120;
     SendMessageW(g_hList, LVM_SETCOLUMNWIDTH, 1, MAKELPARAM(w2, 0));
+    /* 图标视图：窗口变大/最大化后要让图标按新宽度重新排列（Windows 不会自动重排） */
+    if (g_viewMode == 1 && g_views > 0) {
+        SendMessageW(g_hList, LVM_ARRANGE, LVA_DEFAULT, 0);
+        InvalidateRect(g_hList, NULL, FALSE);
+    }
 }
 
 static void set_view(int mode)
@@ -1988,7 +2043,7 @@ static void set_view(int mode)
     LONG style;
     if (mode == g_viewMode || !g_hList) return;
     style = GetWindowLongW(g_hList, GWL_STYLE) & ~LVS_TYPEMASK;
-    style |= (mode == 1) ? LVS_ICON : LVS_REPORT;
+    style |= (mode == 1) ? (LVS_ICON | LVS_AUTOARRANGE) : LVS_REPORT;
     SetWindowLongW(g_hList, GWL_STYLE, style);
     SendMessageW(g_hList, LVM_SETIMAGELIST, (mode == 1) ? LVSIL_NORMAL : LVSIL_SMALL,
                  (LPARAM)((mode == 1) ? g_himlLarge : g_himlSmall));
@@ -1999,6 +2054,7 @@ static void set_view(int mode)
         layout(g_hMain);                                  /* 恢复两列与列宽 */
     } else {
         SendMessageW(g_hList, LVM_SETICONSPACING, 0, MAKELPARAM(112, 84));   /* 单元格加宽，中文名少截断 */
+        SendMessageW(g_hList, LVM_ARRANGE, LVA_DEFAULT, 0);                  /* 立刻按当前宽度排一次 */
     }
     InvalidateRect(g_hList, NULL, TRUE);
 }
@@ -2042,6 +2098,11 @@ static void build_menu(HWND hwnd)
     AppendMenuW(m2, MF_STRING, IDM_ADD,     L"添加工具(&N)…\tCtrl+N");
     AppendMenuW(m2, MF_STRING, IDM_EDIT,    L"编辑选中条目(&E)…");
     AppendMenuW(m2, MF_STRING, IDM_DEL,     L"删除选中条目(&D)\tDel");
+    AppendMenuW(m2, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m2, MF_STRING, IDM_MOVEPANEL, L"把选中条目移动到面板(&M)…");
+    AppendMenuW(m2, MF_STRING, IDM_NEWPANEL,  L"新建面板(&P)…");
+    AppendMenuW(m2, MF_STRING, IDM_RENPANEL,  L"重命名当前面板(&R)…");
+    AppendMenuW(m2, MF_STRING, IDM_DELPANEL,  L"删除当前空面板(&A)…");
     AppendMenuW(m3, MF_STRING, IDM_README,  L"使用说明(&H)");
     AppendMenuW(m3, MF_STRING, IDM_ABOUT,   L"关于(&A)");
     AppendMenuW(m4, MF_STRING, IDM_VIEW_LIST, L"列表视图（带小图标）\tCtrl+1");
@@ -2093,8 +2154,349 @@ static void fill_panels(void)
         _snwprintf(s, 127, L"%s (%d)", g_panels[j], c); s[127] = 0;
         SendMessageW(g_hPanel, LB_ADDSTRING, 0, (LPARAM)s);
     }
+    SendMessageW(g_hPanel, LB_ADDSTRING, 0, (LPARAM)L"＋ 新建面板…");
     SendMessageW(g_hPanel, LB_SETCURSEL, 0, 0);
     g_panelSel = 0;
+}
+
+/* ---------- 面板管理：新建 / 重命名 / 删除 / 把条目移到别的面板 ---------- */
+static int panel_item_count(const WCHAR *name)
+{
+    int c = 0;
+    for (int i = 0; i < g_count; i++)
+        if (!g_items[i].bi && !wcscmp(g_items[i].panel, name)) c++;
+    return c;
+}
+static int xpanel_idx(const WCHAR *name)
+{
+    for (int k = 0; k < g_xpanelsN; k++) if (!wcscmp(g_xpanels[k], name)) return k;
+    return -1;
+}
+static void xpanel_add(const WCHAR *name)
+{
+    if (!name || !*name || g_xpanelsN >= MAX_PANELS) return;
+    if (!wcscmp(name, SYSPANEL_NAME) || !wcscmp(name, L"全部")) return;
+    if (xpanel_idx(name) >= 0) return;
+    copy_field(g_xpanels[g_xpanelsN], 64, name, wcslen(name));
+    g_xpanelsN++;
+}
+static void xpanel_del_at(int k)
+{
+    if (k < 0 || k >= g_xpanelsN) return;
+    for (int i = k; i < g_xpanelsN - 1; i++) wcscpy(g_xpanels[i], g_xpanels[i + 1]);
+    g_xpanelsN--;
+}
+/* 重建左侧面板列表并选中某个面板（name 为空/找不到 → 选中「全部」） */
+static void refresh_panels_sel(const WCHAR *name)
+{
+    build_panels();
+    fill_panels();
+    if (name && *name) {
+        for (int j = 0; j < g_panelN; j++) {
+            if (!wcscmp(g_panels[j], name)) {
+                SendMessageW(g_hPanel, LB_SETCURSEL, j + 1, 0);
+                g_panelSel = j + 1;
+                break;
+            }
+        }
+    }
+    refresh_list();
+}
+
+/* 「输入/选择面板名」小对话框（普通窗口 + 嵌套消息循环，不用资源） */
+static LRESULT CALLBACK PanelDlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_CREATE: {
+        HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(h, GWLP_HINSTANCE);
+        HWND lab = CreateWindowExW(0, L"STATIC", g_pdLabel, WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 10, 10, h, (HMENU)IDC_PDLG_LABEL, hi, NULL);
+        SendMessageW(lab, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        if (g_pdUseCombo) {
+            g_pdEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL,
+                0, 0, 10, 260, h, (HMENU)IDC_PDLG_EDIT, hi, NULL);
+            for (int k = 0; k < g_panelN; k++)
+                if (wcscmp(g_panels[k], SYSPANEL_NAME))
+                    SendMessageW(g_pdEdit, CB_ADDSTRING, 0, (LPARAM)g_panels[k]);
+        } else {
+            g_pdEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                0, 0, 10, 10, h, (HMENU)IDC_PDLG_EDIT, hi, NULL);
+        }
+        SendMessageW(g_pdEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        HWND hint = CreateWindowExW(0, L"STATIC", g_pdHint, WS_CHILD | WS_VISIBLE | SS_LEFT,
+            0, 0, 10, 10, h, (HMENU)IDC_PDLG_HINT, hi, NULL);
+        SendMessageW(hint, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        HWND ok = CreateWindowExW(0, L"BUTTON", L"确定(&O)", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            0, 0, 10, 10, h, (HMENU)IDC_PDLG_OK, hi, NULL);
+        HWND cc = CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0, 0, 10, 10, h, (HMENU)IDC_PDLG_CANCEL, hi, NULL);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        SendMessageW(cc, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(w);
+        if (id == IDC_PDLG_OK || id == IDOK) {
+            WCHAR *s;
+            size_t n;
+            GetWindowTextW(g_pdEdit, g_pdOut, 63); g_pdOut[63] = 0;
+            s = g_pdOut;
+            while (*s == L' ' || *s == L'\t') s++;
+            if (s != g_pdOut) memmove(g_pdOut, s, (wcslen(s) + 1) * sizeof(WCHAR));
+            n = wcslen(g_pdOut);
+            while (n && (g_pdOut[n - 1] == L' ' || g_pdOut[n - 1] == L'\t')) g_pdOut[--n] = 0;
+            if (wcschr(g_pdOut, L'|') || wcschr(g_pdOut, L'\t')) {
+                MessageBoxW(h, L"面板名里不能有竖线 “|”（配置用竖线分隔字段）。", APP_NAME, MB_ICONWARNING);
+                SetFocus(g_pdEdit); return 0;
+            }
+            if (!g_pdOut[0]) { MessageBoxW(h, L"请填写面板名称。", APP_NAME, MB_ICONWARNING); SetFocus(g_pdEdit); return 0; }
+            if (!wcscmp(g_pdOut, SYSPANEL_NAME)) {
+                MessageBoxW(h, L"「" SYSPANEL_NAME L"」是程序内置面板名，请换一个名字。", APP_NAME, MB_ICONWARNING);
+                SetFocus(g_pdEdit); return 0;
+            }
+            if (!wcscmp(g_pdOut, L"全部")) {
+                MessageBoxW(h, L"「全部」是内置的汇总视图，不能作为面板名。", APP_NAME, MB_ICONWARNING);
+                SetFocus(g_pdEdit); return 0;
+            }
+            g_pdOK = 1;
+            DestroyWindow(h);
+            return 0;
+        }
+        if (id == IDC_PDLG_CANCEL || id == IDCANCEL) { g_pdOK = 0; DestroyWindow(h); return 0; }
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)w, TRANSPARENT);
+        return (LRESULT)g_hBg;
+    case WM_CLOSE:
+        g_pdOK = 0;
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        g_hPDlg = NULL;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void pdlg_layout(HWND h)
+{
+    RECT rc;
+    int w, pad = 14, lw = 62, hh = 24, bw = 78, foot;
+    GetClientRect(h, &rc);
+    w = rc.right - rc.left;
+    MoveWindow(GetDlgItem(h, IDC_PDLG_LABEL), pad, 16, w - pad * 2, 18, TRUE);
+    MoveWindow(g_pdEdit, pad, 38, w - pad * 2, g_pdUseCombo ? 240 : hh, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_PDLG_HINT), pad, 74, w - pad * 2, 36, TRUE);
+    foot = rc.bottom - 42;
+    MoveWindow(GetDlgItem(h, IDC_PDLG_OK),     w - pad - bw * 2 - 8, foot, bw, 26, TRUE);
+    MoveWindow(GetDlgItem(h, IDC_PDLG_CANCEL), w - pad - bw,         foot, bw, 26, TRUE);
+}
+
+/* 返回 1 = 用户确定，结果在 out（UTF-16，已去首尾空白、已校验） */
+static int ask_panel_name(HWND owner, const WCHAR *title, const WCHAR *label, const WCHAR *hint,
+                          const WCHAR *initial, int withList, WCHAR *out, size_t cap)
+{
+    static int reg = 0;
+    WNDCLASSEXW wc;
+    MSG m;
+    RECT rc;
+    HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(owner, GWLP_HINSTANCE);
+
+    g_pdLabel = label; g_pdHint = hint; g_pdUseCombo = withList;
+    g_pdOK = 0; g_pdOut[0] = 0;
+    if (!reg) {
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = PanelDlgProc;
+        wc.hInstance = hi;
+        wc.lpszClassName = L"ForensicToolboxPanelDlg";
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = g_hBg;
+        wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
+        wc.hIconSm = wc.hIcon;
+        if (!RegisterClassExW(&wc)) return 0;
+        reg = 1;
+    }
+    rc.left = 0; rc.top = 0; rc.right = 400; rc.bottom = withList ? 200 : 190;
+    AdjustWindowRectEx(&rc, WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT);
+    g_hPDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, L"ForensicToolboxPanelDlg", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+        owner, NULL, hi, NULL);
+    if (!g_hPDlg) return 0;
+    pdlg_layout(g_hPDlg);
+    EnableWindow(owner, FALSE);
+    ShowWindow(g_hPDlg, SW_SHOW);
+    UpdateWindow(g_hPDlg);
+    SetForegroundWindow(g_hPDlg);
+    SetWindowTextW(g_pdEdit, initial ? initial : L"");
+    SetFocus(g_pdEdit);
+    SendMessageW(g_pdEdit, EM_SETSEL, 0, -1);
+    {
+        MSG dq;
+        while (PeekMessageW(&dq, NULL, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) ;
+    }
+    while (IsWindow(g_hPDlg) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) { g_pdOK = 0; DestroyWindow(g_hPDlg); continue; }
+        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN && IsChild(g_hPDlg, m.hwnd)) {
+            PostMessageW(g_hPDlg, WM_COMMAND, IDC_PDLG_OK, 0);
+            continue;
+        }
+        if (!IsDialogMessageW(g_hPDlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    SetActiveWindow(owner);
+    if (g_pdOK && out && cap) { wcsncpy(out, g_pdOut, cap - 1); out[cap - 1] = 0; }
+    return g_pdOK;
+}
+
+static void do_new_panel(void)
+{
+    WCHAR nm[64], msg[520];
+    if (!ask_panel_name(g_hMain, L"新建面板", L"新面板的名称：",
+                        L"建好以后：把文件拖进窗口，或用「＋ 添加工具」时在“面板”一栏选它；\r\n"
+                        L"也可以右键列表里的条目选「移动到面板…」。",
+                        L"", 0, nm, 64)) return;
+    xpanel_add(nm);
+    if (!save_config()) { show_save_error(); return; }
+    refresh_panels_sel(nm);
+    if (panel_item_count(nm) == 0) {
+        _snwprintf(msg, 519, L"已新建空面板「%s」。\n\n往里面加工具：\n"
+                   L"· 把一个或多个 exe/bat/ps1 直接拖进窗口；\n"
+                   L"· 或者点右上角「＋ 添加工具」——“面板”那一栏选「%s」。", nm, nm);
+        msg[519] = 0;
+        MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+    }
+}
+
+static void do_rename_panel(void)
+{
+    WCHAR old[64], nm[64];
+    int k;
+    if (g_panelSel <= 0 || g_panelSel - 1 >= g_panelN) {
+        MessageBoxW(g_hMain, L"请先在左侧列表里选中一个面板（不能是「全部」）。", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    copy_field(old, 64, g_panels[g_panelSel - 1], wcslen(g_panels[g_panelSel - 1]));
+    if (!wcscmp(old, SYSPANEL_NAME)) {
+        MessageBoxW(g_hMain, L"内置「" SYSPANEL_NAME L"」不能改名。", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (!ask_panel_name(g_hMain, L"重命名面板", L"新的面板名：",
+                        L"这个面板里的条目会一起改到新名字；\r\n如果新名字是已有面板，两个面板就会合并成一个。",
+                        old, 0, nm, 64)) return;
+    if (!wcscmp(nm, old)) return;
+    k = xpanel_idx(old);
+    if (k >= 0) copy_field(g_xpanels[k], 64, nm, wcslen(nm));
+    for (int i = 0; i < g_count; i++)
+        if (!g_items[i].bi && !wcscmp(g_items[i].panel, old))
+            copy_field(g_items[i].panel, 64, nm, wcslen(nm));
+    if (!save_config()) { show_save_error(); return; }
+    refresh_panels_sel(nm);
+}
+
+static void do_del_panel(void)
+{
+    WCHAR nm[64], msg[520];
+    int c;
+    if (g_panelSel <= 0 || g_panelSel - 1 >= g_panelN) {
+        MessageBoxW(g_hMain, L"请先在左侧列表里选中一个面板（不能是「全部」）。", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    copy_field(nm, 64, g_panels[g_panelSel - 1], wcslen(g_panels[g_panelSel - 1]));
+    if (!wcscmp(nm, SYSPANEL_NAME)) {
+        MessageBoxW(g_hMain, L"内置「" SYSPANEL_NAME L"」不能删除（想隐藏就在 tools_utf8.txt 里写 #SYSPANEL=0 再按 F5）。",
+                    APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    c = panel_item_count(nm);
+    if (c > 0) {
+        _snwprintf(msg, 519, L"面板「%s」里还有 %d 个条目。\n\n先把它们删掉（选中 + Del）或右键「移动到面板…」移到别处，这个面板就自己消失了。", nm, c);
+        msg[519] = 0;
+        MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    _snwprintf(msg, 519, L"删除空面板「%s」？\n（只是不再显示这一栏，磁盘上的文件不动）", nm);
+    msg[519] = 0;
+    if (MessageBoxW(g_hMain, msg, APP_NAME, MB_ICONWARNING | MB_YESNO) != IDYES) return;
+    xpanel_del_at(xpanel_idx(nm));
+    if (!save_config()) { show_save_error(); return; }
+    refresh_panels_sel(NULL);
+}
+
+static void do_move_to_panel(void)
+{
+    int idx = selected_item();
+    WCHAR nm[64];
+    if (idx < 0) { MessageBoxW(g_hMain, L"请先在列表里选中要移动的条目。", APP_NAME, MB_ICONINFORMATION); return; }
+    if (g_items[idx].bi) {
+        MessageBoxW(g_hMain, L"「" SYSPANEL_NAME L"」里的内置项不能移动（它们是程序自带的快捷入口）。",
+                    APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (!ask_panel_name(g_hMain, L"移动到面板", L"目标面板：",
+                        L"下拉里选一个已有面板，或直接输入新名字（等于新建一个面板）。",
+                        g_items[idx].panel, 1, nm, 64)) return;
+    if (!wcscmp(nm, g_items[idx].panel)) return;
+    copy_field(g_items[idx].panel, 64, nm, wcslen(nm));
+    if (!save_config()) { show_save_error(); return; }
+    refresh_panels_sel(nm);
+    select_by_rel(g_items[idx].rel);
+}
+
+static void do_move_here(void)
+{
+    int idx = selected_item();
+    WCHAR nm[64];
+    nm[0] = 0;
+    if (g_menuPanel[0]) copy_field(nm, 64, g_menuPanel, wcslen(g_menuPanel));
+    else if (g_panelSel > 0 && g_panelSel - 1 < g_panelN)
+        copy_field(nm, 64, g_panels[g_panelSel - 1], wcslen(g_panels[g_panelSel - 1]));
+    if (!nm[0]) { MessageBoxW(g_hMain, L"请先在左侧选中一个面板（不能是「全部」）。", APP_NAME, MB_ICONINFORMATION); return; }
+    if (!wcscmp(nm, SYSPANEL_NAME)) {
+        MessageBoxW(g_hMain, L"内置「" SYSPANEL_NAME L"」只放程序自带的入口，不能把工具移进去。", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (idx < 0) { MessageBoxW(g_hMain, L"请先在右侧列表里选中要移动的条目，再右键左侧的面板。", APP_NAME, MB_ICONINFORMATION); return; }
+    if (g_items[idx].bi) {
+        MessageBoxW(g_hMain, L"「" SYSPANEL_NAME L"」里的内置项不能移动。", APP_NAME, MB_ICONINFORMATION);
+        return;
+    }
+    if (!wcscmp(g_items[idx].panel, nm)) return;
+    copy_field(g_items[idx].panel, 64, nm, wcslen(nm));
+    if (!save_config()) { show_save_error(); return; }
+    refresh_panels_sel(nm);
+    select_by_rel(g_items[idx].rel);
+}
+
+static void show_panel_menu(void)
+{
+    POINT pt, cp;
+    HMENU m = CreatePopupMenu();
+    int row = -1, can;
+    GetCursorPos(&pt);
+    cp = pt;
+    ScreenToClient(g_hPanel, &cp);
+    if (cp.x >= 0 && cp.y >= 0) {
+        LRESULT r = SendMessageW(g_hPanel, LB_ITEMFROMPOINT, 0, MAKELPARAM(cp.x, cp.y));
+        if (!HIWORD(r)) row = (int)LOWORD(r);
+    }
+    g_menuPanel[0] = 0;
+    if (row > 0 && row <= g_panelN) copy_field(g_menuPanel, 64, g_panels[row - 1], wcslen(g_panels[row - 1]));
+    can = (g_menuPanel[0] && wcscmp(g_menuPanel, SYSPANEL_NAME)) ? 0 : MF_GRAYED;
+    AppendMenuW(m, MF_STRING, IDM_NEWPANEL, L"新建面板…");
+    AppendMenuW(m, MF_STRING | can, IDM_MOVEHERE, L"把选中的工具移动到此面板");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | can, IDM_RENPANEL, L"重命名此面板…");
+    AppendMenuW(m, MF_STRING | can, IDM_DELPANEL, L"删除此面板（仅空面板）");
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hMain, NULL);
+    DestroyMenu(m);
 }
 
 static void create_children(HWND hwnd)
@@ -2166,6 +2568,7 @@ static void show_list_menu(BOOL blank)
         AppendMenuW(m, MF_STRING, IDM_FOLDER, L"打开所在文件夹");
         AppendMenuW(m, MF_STRING, IDM_COPY,   L"复制完整路径");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(m, MF_STRING, IDM_MOVEPANEL, L"移动到面板…");
         AppendMenuW(m, MF_STRING, IDM_EDIT,   L"编辑此条目…");
         AppendMenuW(m, MF_STRING, IDM_DEL,    L"删除此条目");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -2222,7 +2625,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (id == IDC_ADDBTN && code == BN_CLICKED) { do_add_tools(); return 0; }
         if (id == IDC_PANEL && code == LBN_SELCHANGE) {
             int s = (int)SendMessageW(g_hPanel, LB_GETCURSEL, 0, 0);
-            g_panelSel = (s < 0) ? 0 : s;
+            if (s == g_panelN + 1) {                     /* 点的是最后一行「＋ 新建面板…」 */
+                SendMessageW(g_hPanel, LB_SETCURSEL, g_panelSel, 0);   /* 先还原选中 */
+                do_new_panel();
+                return 0;
+            }
+            g_panelSel = (s < 0 || s > g_panelN) ? 0 : s;
             refresh_list(); return 0;
         }
         if (id >= IDM_BI_FIRST && id < IDM_BI_FIRST + BI_MAX) {   /* 「系统」菜单里的内置入口 */
@@ -2231,6 +2639,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         switch (id) {
         case IDM_GOSYS:   goto_syspanel(); return 0;
+        case IDM_MOVEPANEL: do_move_to_panel(); return 0;
+        case IDM_MOVEHERE:  do_move_here(); return 0;
+        case IDM_NEWPANEL:  do_new_panel(); return 0;
+        case IDM_RENPANEL:  do_rename_panel(); return 0;
+        case IDM_DELPANEL:  do_del_panel(); return 0;
         case IDM_RUN:     do_launch(selected_item(), 0); return 0;
         case IDM_RUNAS:   do_launch(selected_item(), 1); return 0;
         case IDM_FOLDER:  open_folder_of(selected_item()); return 0;
@@ -2261,6 +2674,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 L"· 双击列表项或回车启动；右键可“以管理员身份运行/打开所在文件夹/复制完整路径”\n"
                 L"· 【添加工具】右上角按钮 / 工具菜单 / 右键菜单，也可以把文件直接拖进窗口\n"
                 L"    添加时可新建面板（面板框里直接输入新名字）；选中条目可编辑、删除（Del 键）\n"
+                L"· 面板管理：左侧列表最后一行的「＋ 新建面板…」可以建一个空面板；\n"
+                L"    在左侧面板上右键 = 新建 / 重命名 / 删除空面板 / 把选中的工具移到这个面板；\n"
+                L"    选中条目后右键「移动到面板…」可以把工具换到别的面板（下拉选已有，或输入新名字）\n"
                 L"· 配置为同目录 tools_utf8.txt（UTF-8），界面里的增删改会直接写回该文件，\n"
                 L"  首次写回前自动备份为 tools_utf8.txt.bak；路径相对本程序所在目录，\n"
                 L"  所以整个工具箱换盘符、换电脑都不会失效\n\n"
@@ -2340,6 +2756,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CONTEXTMENU: {
         if ((HWND)wp == g_hList) return 0;      /* 由 NM_RCLICK 处理，避免弹两次 */
+        if ((HWND)wp == g_hPanel) { show_panel_menu(); return 0; }          /* 左侧面板列表 */
+        if (!wp && GetFocus() == g_hPanel) { show_panel_menu(); return 0; }  /* 键盘菜单键 */
         show_list_menu(selected_item() < 0);
         return 0;
     }
