@@ -27,7 +27,7 @@
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.6"
+#define APP_VER     L"1.6.1"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
 #define SYSPANEL_NAME L"系统面板"        /* 内置面板名（配置里 #SYSPANEL=0 可隐藏） */
@@ -115,6 +115,7 @@ static int   g_viewPref = 0;          /* 配置里 #VIEW=icon 时用大图标视
 /* 配置文件位置与原始注释头（保存时原样回写，便于手工编辑） */
 static WCHAR g_cfgPath[MAX_PATH * 2] = L"";
 static UINT  g_cfgCP = CP_UTF8;
+static const WCHAR *g_cfgEncName = L"UTF-8";   /* 实际按哪种编码读进来的（--selftest 报告用） */
 static WCHAR *g_header = NULL;
 static size_t g_headerCap = 0, g_headerLen = 0;
 static int   g_windowMemory = 0;
@@ -237,7 +238,7 @@ static void join_path(WCHAR *out, size_t cap, const WCHAR *dir, const WCHAR *rel
     out[cap - 1] = 0;
 }
 
-static WCHAR *read_text_file(const WCHAR *path, UINT codepage)
+static WCHAR *read_text_file2(const WCHAR *path, UINT codepage, int strict)
 {
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) return NULL;
@@ -251,11 +252,25 @@ static WCHAR *read_text_file(const WCHAR *path, UINT codepage)
     buf[got] = 0;
     DWORD off = 0;
     if (got >= 3 && (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF) off = 3;
-    int need = MultiByteToWideChar(codepage, 0, buf + off, got - off, NULL, 0);
+    if (got <= off) {                            /* 空文件也是合法的（别当成"解码失败"） */
+        WCHAR *e = (WCHAR *)malloc(2 * sizeof(WCHAR));
+        if (e) e[0] = 0;
+        free(buf);
+        return e;
+    }
+    /* strict=1：整个文件必须是该代码页的合法序列（MB_ERR_INVALID_CHARS），
+       用来判断"这到底是 UTF-8 还是别的编码"——别再用"能不能读出来"当判据。 */
+    UINT flags = strict ? MB_ERR_INVALID_CHARS : 0;
+    int need = MultiByteToWideChar(codepage, flags, buf + off, got - off, NULL, 0);
+    if (need <= 0) { free(buf); return NULL; }
     WCHAR *w = (WCHAR *)malloc((need + 2) * sizeof(WCHAR));
-    if (w) { MultiByteToWideChar(codepage, 0, buf + off, got - off, w, need); w[need] = 0; }
+    if (w) { MultiByteToWideChar(codepage, flags, buf + off, got - off, w, need); w[need] = 0; }
     free(buf);
     return w;
+}
+static WCHAR *read_text_file(const WCHAR *path, UINT codepage)
+{
+    return read_text_file2(path, codepage, 0);
 }
 
 static void copy_field(WCHAR *dst, size_t cap, const WCHAR *src, size_t len)
@@ -831,6 +846,7 @@ static void load_config(void)
     g_count = 0;
     g_cfgPath[0] = 0;
     g_cfgCP = CP_UTF8;
+    g_cfgEncName = L"UTF-8";
     g_noCache = 0;
     g_sysPanel = 1;
     g_xpanelsN = 0;
@@ -839,15 +855,36 @@ static void load_config(void)
     ZeroMemory(&g_windowRect, sizeof(g_windowRect));
     g_checkPos = 0;
     g_checking = 0;
+    /* 这两个必须一起重置：否则界面里 F5 换到一个没有 #TITLE / #VIEW 的配置时，
+       会继续沿用上一个配置的标题和大图标视图，还会把 #VIEW=icon 写回新配置 */
+    wcsncpy(g_appTitle, APP_NAME, 127); g_appTitle[127] = 0;
+    g_viewPref = 0;
     header_reset();
 
+    /* 配置编码按内容判定，不按文件名想当然：
+       ① tools_utf8.txt 必须是「合法 UTF-8」（严格模式）才采用；
+       ② 同名文件在、但不是合法 UTF-8（常见于改名没转码）→ 按 GBK 再试一次；
+       ③ 再找 tools_gbk.txt，固定先按 GBK(936) 解，不行才退系统 ANSI 代码页。
+       以前 ① 用"能不能读出来"当判据，非法 UTF-8 会被替换成 U+FFFD 照读不误，
+       结果是乱码标题 + 空列表，还不报错、也不去读 tools_gbk.txt。 */
     join_path(path, MAX_PATH * 2, g_root, L"tools_utf8.txt");
-    text = read_text_file(path, CP_UTF8);
-    if (text) { wcsncpy(g_cfgPath, path, MAX_PATH * 2 - 1); g_cfgPath[MAX_PATH * 2 - 1] = 0; g_cfgCP = CP_UTF8; }
+    text = read_text_file2(path, CP_UTF8, 1);
+    if (text) { g_cfgCP = CP_UTF8; g_cfgEncName = L"UTF-8"; }
+    if (!text && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        text = read_text_file(path, 936);
+        if (text) { g_cfgCP = 936; g_cfgEncName = L"GBK(936)，文件名是 tools_utf8.txt 但内容不是 UTF-8"; }
+    }
     if (!text) {
         join_path(path, MAX_PATH * 2, g_root, L"tools_gbk.txt");
-        text = read_text_file(path, CP_ACP);
-        if (text) { wcsncpy(g_cfgPath, path, MAX_PATH * 2 - 1); g_cfgPath[MAX_PATH * 2 - 1] = 0; g_cfgCP = CP_ACP; }
+        text = read_text_file(path, 936);
+        if (text) { g_cfgCP = 936; g_cfgEncName = L"GBK(936)"; }
+        else {
+            text = read_text_file(path, CP_ACP);
+            if (text) { g_cfgCP = CP_ACP; g_cfgEncName = L"系统 ANSI 代码页（tools_gbk.txt 不是 GBK）"; }
+        }
+    }
+    if (text) {
+        wcsncpy(g_cfgPath, path, MAX_PATH * 2 - 1); g_cfgPath[MAX_PATH * 2 - 1] = 0;
     }
     if (!text) {
         /* 没有配置文件也不终止：让用户可以直接用界面添加工具，保存时自动创建 */
@@ -930,6 +967,7 @@ static void load_config(void)
 }
 
 /* ---------- 保存配置（写回原文件，首次写前备份 .bak） ---------- */
+/* 写配置（带失败检查）。返回 0 = 写失败，必须在内存里失败前就返回，让调用方知道没写成。 */
 static int write_conv(HANDLE h, const WCHAR *s)
 {
     char *buf;
@@ -940,21 +978,23 @@ static int write_conv(HANDLE h, const WCHAR *s)
     buf = (char *)malloc(need);
     if (!buf) return 0;
     len = WideCharToMultiByte(g_cfgCP, 0, s, -1, buf, need, NULL, NULL);
-    if (len > 0) WriteFile(h, buf, len - 1, &wr, NULL);
+    if (len > 0) {
+        wr = 0;
+        if (!WriteFile(h, buf, len - 1, &wr, NULL) || wr != (DWORD)(len - 1)) { free(buf); return 0; }
+    }
     free(buf);
     return 1;
 }
 static int write_crlf(HANDLE h)
 {
-    DWORD wr;
-    WriteFile(h, "\r\n", 2, &wr, NULL);
-    return 1;
+    DWORD wr = 0;
+    return WriteFile(h, "\r\n", 2, &wr, NULL) && wr == 2;
 }
 /* 把条目写进一个已打开的文件；onlyVisible=1 时只写当前列表里显示的那些 */
-static void write_items(HANDLE h, int onlyVisible)
+static int write_items(HANDLE h, int onlyVisible)
 {
     WCHAR line[4096];
-    int idx, n = onlyVisible ? g_views : g_count;
+    int idx, ok = 1, n = onlyVisible ? g_views : g_count;
     for (idx = 0; idx < n; idx++) {
         ITEM *it = &g_items[onlyVisible ? g_view[idx] : idx];
         WCHAR panel[64], title[256], rel[1024], args[512];
@@ -966,64 +1006,78 @@ static void write_items(HANDLE h, int onlyVisible)
         sanitize_field(panel); sanitize_field(title); sanitize_field(rel); sanitize_field(args);
         _snwprintf(line, 4095, L"%s|%s|%s|%s", panel, title, rel, args);
         line[4095] = 0;
-        write_conv(h, line); write_crlf(h);
+        ok = write_conv(h, line) && ok;
+        ok = write_crlf(h) && ok;
     }
+    return ok;
 }
 
 /* 写配置；path/cp 可指定（导出用），onlyVisible 只写当前显示 */
 static int save_config_ex(const WCHAR *path, UINT cp, int onlyVisible, int backup)
 {
     WCHAR bak[MAX_PATH * 2 + 8];
+    WCHAR tmp[MAX_PATH * 2 + 8];
     WCHAR line[4096];
     HANDLE h;
-    DWORD wr;
     UINT oldCP = g_cfgCP;
 
     if (!path || !*path) return 0;
     if (backup) {
-        /* 只备份一次（保留最初版本，防止误改无法回退） */
+        /* 只备份一次（保留最初版本，防止误改无法回退）。
+           备份失败就不动原文件——以前备份失败照样覆盖原配置，等于把唯一的退路也丢了。 */
         wcsncpy(bak, path, MAX_PATH * 2 - 1); bak[MAX_PATH * 2 - 1] = 0;
         wcsncat(bak, L".bak", 8);
-        if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES)
-            CopyFileW(path, bak, TRUE);
+        if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES
+            && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES
+            && !CopyFileW(path, bak, TRUE)) return 0;
     }
+    /* 先写同目录临时文件，全部写完并 flush 成功后再原子替换。
+       直接 CREATE_ALWAYS 覆盖原文件时，磁盘满 / 被杀 / I/O 错误都会留下半截配置。 */
+    wcsncpy(tmp, path, MAX_PATH * 2 - 1); tmp[MAX_PATH * 2 - 1] = 0;
+    wcsncat(tmp, L".tmp", 8);
     g_cfgCP = cp;                       /* write_conv 按 g_cfgCP 转码 */
-    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+    h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (h == INVALID_HANDLE_VALUE) { g_cfgCP = oldCP; return 0; }
-    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = 1;
     if (g_cfgCP == CP_UTF8) {
         const char bom[3] = { (char)0xEF, (char)0xBB, (char)0xBF };
-        WriteFile(h, bom, 3, &wr, NULL);
+        DWORD wb = 0;
+        if (!WriteFile(h, bom, 3, &wb, NULL) || wb != 3) ok = 0;
     }
     _snwprintf(line, 4095, L"# 本文件由「%s」界面自动维护；每行格式：面板|名称|相对路径|参数", APP_NAME);
     line[4095] = 0;
-    write_conv(h, line); write_crlf(h);
+    ok = write_conv(h, line) && ok; ok = write_crlf(h) && ok;
     _snwprintf(line, 4095, L"# 路径可写相对本程序目录的相对路径（如 工具\\xxx.exe）；工具箱目录外的文件会记为绝对路径");
     line[4095] = 0;
-    write_conv(h, line); write_crlf(h);
+    ok = write_conv(h, line) && ok; ok = write_crlf(h) && ok;
     _snwprintf(line, 4095, L"#TITLE=%s", g_appTitle);
     line[4095] = 0;
-    write_conv(h, line); write_crlf(h);
-    if (g_viewPref) { write_conv(h, L"#VIEW=icon"); write_crlf(h); }
-    if (!g_sysPanel) { write_conv(h, L"#SYSPANEL=0"); write_crlf(h); }
-    if (g_noCache)   { write_conv(h, L"#NOCACHE=1"); write_crlf(h); }
+    ok = write_conv(h, line) && ok; ok = write_crlf(h) && ok;
+    if (g_viewPref) { ok = write_conv(h, L"#VIEW=icon") && ok; ok = write_crlf(h) && ok; }
+    if (!g_sysPanel) { ok = write_conv(h, L"#SYSPANEL=0") && ok; ok = write_crlf(h) && ok; }
+    if (g_noCache)   { ok = write_conv(h, L"#NOCACHE=1") && ok; ok = write_crlf(h) && ok; }
     if (g_windowMemory) {
         _snwprintf(line, 4095, L"#WINDOW=%d,%d,%d,%d", g_windowRect.left, g_windowRect.top,
                    g_windowRect.right - g_windowRect.left, g_windowRect.bottom - g_windowRect.top);
         line[4095] = 0;
-        write_conv(h, line); write_crlf(h);
-        if (g_windowMax) { write_conv(h, L"#WINDOWMAX=1"); write_crlf(h); }
+        ok = write_conv(h, line) && ok; ok = write_crlf(h) && ok;
+        if (g_windowMax) { ok = write_conv(h, L"#WINDOWMAX=1") && ok; ok = write_crlf(h) && ok; }
     }
     for (int k = 0; k < g_xpanelsN; k++) {          /* 界面里新建的空面板：靠这几行记住 */
         _snwprintf(line, 4095, L"#PANEL=%s", g_xpanels[k]);
         line[4095] = 0;
-        write_conv(h, line); write_crlf(h);
+        ok = write_conv(h, line) && ok; ok = write_crlf(h) && ok;
     }
-    if (g_header && g_headerLen) write_conv(h, g_header);
-    write_items(h, onlyVisible);
-    FlushFileBuffers(h);
+    if (g_header && g_headerLen) ok = write_conv(h, g_header) && ok;
+    ok = write_items(h, onlyVisible) && ok;
+    if (ok) ok = FlushFileBuffers(h) != 0;
     CloseHandle(h);
     g_cfgCP = oldCP;
+    if (!ok) { DeleteFileW(tmp); return 0; }        /* 失败：临时文件删掉，原配置一个字节都没动 */
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp);
+        return 0;
+    }
     return 1;
 }
 static int save_config(void)
@@ -2916,8 +2970,8 @@ static void selftest(const WCHAR *outfile, const WCHAR *kw)
         }
         shown++;
     }
-    n += _snwprintf(rep, ARRAYSIZE(rep), L"标题=%s\r\n总条目=%d\r\n其中内置(%s)=%d\r\n面板数=%d\r\n配置文件=%s\r\n",
-                    g_appTitle, g_count, SYSPANEL_NAME, g_biN, g_panelN, g_cfgPath);
+    n += _snwprintf(rep, ARRAYSIZE(rep), L"标题=%s\r\n总条目=%d\r\n其中内置(%s)=%d\r\n面板数=%d\r\n配置文件=%s\r\n配置编码=%s\r\n",
+                    g_appTitle, g_count, SYSPANEL_NAME, g_biN, g_panelN, g_cfgPath, g_cfgEncName);
     if (g_windowMemory)
         n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n, L"窗口几何=%d,%d,%d,%d%s\r\n",
                         g_windowRect.left, g_windowRect.top, g_windowRect.right - g_windowRect.left,
@@ -3065,65 +3119,74 @@ static void icon_bench(const WCHAR *outfile)
 }
 
 /* 隐藏测试用：导入 / 导出 / 扫描 / 新建空配置 */
-static void cli_import(const WCHAR *file, const WCHAR *report, int replace)
+static int cli_import(const WCHAR *file, const WCHAR *report, int replace)
 {
     static WCHAR rep[4096];
     WCHAR newTitle[128];
     const WCHAR *kind;
-    int dup = 0, added;
+    int dup = 0, added, wr;
     load_config();
     added = import_file_core(file, replace, &dup, &kind, newTitle, 128);
-    if (added < 0) { _snwprintf(rep, 4095, L"导入失败：读不出内容\r\n"); rep[4095] = 0; write_report(report, rep); return; }
+    if (added < 0) { _snwprintf(rep, 4095, L"导入失败：读不出内容\r\n"); rep[4095] = 0; write_report(report, rep); return 2; }
     if (newTitle[0] && replace) copy_field(g_appTitle, 128, newTitle, wcslen(newTitle));
-    save_config();
-    _snwprintf(rep, 4095, L"类型=%s\r\n新增=%d 重复=%d 现有=%d\r\n标题=%s\r\n配置=%s\r\n",
-               kind, added, dup, g_count, g_appTitle, g_cfgPath);
+    wr = save_config();
+    _snwprintf(rep, 4095, L"类型=%s\r\n新增=%d 重复=%d 现有=%d\r\n标题=%s\r\n保存=%s\r\n配置=%s\r\n",
+               kind, added, dup, g_count, g_appTitle, wr ? L"是" : L"否（写入失败，原配置未改动）", g_cfgPath);
     rep[4095] = 0;
     write_report(report, rep);
+    return wr ? 0 : 2;
 }
-static void cli_export(const WCHAR *file, const WCHAR *report, int onlyVisible)
+static int cli_export(const WCHAR *file, const WCHAR *report, int onlyVisible)
 {
     static WCHAR rep[4096];
-    int ok;
+    int ok, n, i, cnt = 0;
     load_config();
+    /* 报告里的条数要数"真正写进去的"：内置「系统面板」条目不进导出文件 */
+    n = onlyVisible ? g_views : g_count;
+    for (i = 0; i < n; i++) if (!g_items[onlyVisible ? g_view[i] : i].bi) cnt++;
     ok = save_config_ex(file, CP_UTF8, onlyVisible, 0);
-    _snwprintf(rep, 4095, L"导出=%s 条数=%d 目标=%s\r\n", ok ? L"成功" : L"失败",
-               onlyVisible ? g_views : g_count, file);
+    _snwprintf(rep, 4095, L"导出=%s 条数=%d 目标=%s\r\n", ok ? L"成功" : L"失败（未写入）", cnt, file);
     rep[4095] = 0;
     write_report(report, rep);
+    return ok ? 0 : 2;
 }
-static void cli_scan(const WCHAR *dir, const WCHAR *report, int recurse)
+static int cli_scan(const WCHAR *dir, const WCHAR *report, int recurse)
 {
     static WCHAR rep[4096];
     WCHAR panel[64];
     const WCHAR *b = base_name(dir);
-    int dup = 0, added;
+    int dup = 0, added, wr = 1;
     load_config();
     copy_field(panel, 64, b && *b ? b : L"新面板", wcslen(b && *b ? b : L"新面板"));
     added = scan_folder_rec(dir, panel, recurse, &dup, 0);
-    if (added > 0) save_config();
-    _snwprintf(rep, 4095, L"面板=%s 新增=%d 重复=%d 现有=%d 递归=%d\r\n", panel, added, dup, g_count, recurse);
+    if (added > 0) wr = save_config();
+    _snwprintf(rep, 4095, L"面板=%s 新增=%d 重复=%d 现有=%d 递归=%d 保存=%s\r\n",
+               panel, added, dup, g_count, recurse,
+               added > 0 ? (wr ? L"是" : L"否（写入失败，原配置未改动）") : L"未写入（无新增）");
     rep[4095] = 0;
     write_report(report, rep);
+    return wr ? 0 : 2;
 }
-static void cli_newcfg(const WCHAR *report)
+static int cli_newcfg(const WCHAR *report)
 {
     static WCHAR rep[2048];
-    int was;
+    int was, wr;
     load_config();
     was = g_count;
     g_count = 0;
-    save_config();
-    _snwprintf(rep, 2047, L"清空前=%d 清空后=%d 配置=%s\r\n", was, g_count, g_cfgPath);
+    wr = save_config();
+    _snwprintf(rep, 2047, L"清空前=%d 清空后=%d 保存=%s 配置=%s\r\n", was, g_count,
+               wr ? L"是" : L"否（写入失败，原配置未改动）", g_cfgPath);
     rep[2047] = 0;
     write_report(report, rep);
+    return wr ? 0 : 2;
 }
 
 /* 隐藏测试用：--additem "面板|名称|相对路径|参数" [报告文件]  走与界面相同的添加+保存逻辑 */
-static void cli_additem(const WCHAR *spec, const WCHAR *outfile)
+static int cli_additem(const WCHAR *spec, const WCHAR *outfile)
 {
     WCHAR buf[2048], *f[4], *q;
-    int nf = 1, dup, ok;
+    int nf = 1, dup, ok, wr = 1;
     static WCHAR rep[4096];
     wcsncpy(buf, spec, 2047); buf[2047] = 0;
     f[0] = buf; f[1] = f[2] = f[3] = (WCHAR *)L"";
@@ -3131,11 +3194,16 @@ static void cli_additem(const WCHAR *spec, const WCHAR *outfile)
     load_config();
     dup = item_exists(f[0], f[2]);
     ok = dup ? 0 : add_item_raw(f[0], f[1], f[2], f[3]);
-    if (!dup) save_config();
+    if (!dup) wr = save_config();
+    /* 写入= 必须看 save_config() 的真实返回值：以前按"添加成功"就写"是"，
+       只读介质 / 磁盘满时报告说写了、其实一个字节都没落盘。 */
     _snwprintf(rep, 4095, L"添加=%s 重复=%d 写入=%s 条目数=%d 配置=%s\r\n",
-               ok ? L"是" : L"否", dup, (ok && !dup) ? L"是" : L"未写入", g_count, g_cfgPath);
+               ok ? L"是" : L"否", dup,
+               dup ? L"未写入（重复条目）" : (wr ? L"是" : L"否（写入失败，原配置未改动）"),
+               g_count, g_cfgPath);
     rep[4095] = 0;
     write_report(outfile, rep);
+    return wr ? 0 : 2;
 }
 
 /* ---------- 入口 ---------- */
@@ -3168,33 +3236,33 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
     }
     if (argc > 1 && !_wcsicmp(argv[1], L"--import")) {
         if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
-        cli_import(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"replace")));
+        int rc = cli_import(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"replace")));
         if (argv) LocalFree(argv);
-        return 0;
+        return rc;
     }
     if (argc > 1 && !_wcsicmp(argv[1], L"--export")) {
         if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
-        cli_export(argc > 2 ? argv[2] : L"", out, 0);
+        int rc = cli_export(argc > 2 ? argv[2] : L"", out, 0);
         if (argv) LocalFree(argv);
-        return 0;
+        return rc;
     }
     if (argc > 1 && !_wcsicmp(argv[1], L"--scan")) {
         if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
-        cli_scan(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"r")));
+        int rc = cli_scan(argc > 2 ? argv[2] : L"", out, (argc > 4 && !_wcsicmp(argv[4], L"r")));
         if (argv) LocalFree(argv);
-        return 0;
+        return rc;
     }
     if (argc > 1 && !_wcsicmp(argv[1], L"--newcfg")) {
         if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
-        cli_newcfg(out);
+        int rc = cli_newcfg(out);
         if (argv) LocalFree(argv);
-        return 0;
+        return rc;
     }
     if (argc > 1 && !_wcsicmp(argv[1], L"--additem")) {
         if (argc > 3) wcsncpy(out, argv[3], MAX_PATH * 2 - 1);
-        cli_additem(argc > 2 ? argv[2] : L"", out);
+        int rc = cli_additem(argc > 2 ? argv[2] : L"", out);
         if (argv) LocalFree(argv);
-        return 0;
+        return rc;
     }
     if (argc > 1 && (!_wcsicmp(argv[1], L"--syspanel") || !_wcsicmp(argv[1], L"-syspanel"))) {
         if (argc > 2) wcsncpy(out, argv[2], MAX_PATH * 2 - 1);
