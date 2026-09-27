@@ -27,7 +27,7 @@
 #include <wchar.h>
 
 #define APP_NAME    L"便携快速启动器"
-#define APP_VER     L"1.5"
+#define APP_VER     L"1.6"
 #define MAX_ITEMS   6000
 #define MAX_PANELS  128
 #define SYSPANEL_NAME L"系统面板"        /* 内置面板名（配置里 #SYSPANEL=0 可隐藏） */
@@ -117,6 +117,10 @@ static WCHAR g_cfgPath[MAX_PATH * 2] = L"";
 static UINT  g_cfgCP = CP_UTF8;
 static WCHAR *g_header = NULL;
 static size_t g_headerCap = 0, g_headerLen = 0;
+static int   g_windowMemory = 0;
+static int   g_windowMax = 0;
+static RECT  g_windowRect = { 0, 0, 0, 0 };
+static int   g_windowSaveEnabled = 0;
 
 static HWND g_hMain, g_hSearch, g_hPanel, g_hList, g_hStatus, g_hAdd;
 static HFONT g_hFont = NULL;
@@ -769,6 +773,57 @@ static void header_add(const WCHAR *line)
     g_header[g_headerLen] = 0;
 }
 
+static int window_geometry_visible(const RECT *r)
+{
+    RECT screen, visible;
+    if (GetSystemMetrics(SM_CXVIRTUALSCREEN) <= 0 || GetSystemMetrics(SM_CYVIRTUALSCREEN) <= 0)
+        return 0;
+    screen.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    screen.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    screen.right = screen.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    screen.bottom = screen.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return IntersectRect(&visible, r, &screen) != 0 &&
+           (r->right - r->left) >= 480 && (r->bottom - r->top) >= 320;
+}
+
+static int apply_window_memory(HWND hwnd)
+{
+    WINDOWPLACEMENT wp;
+    if (!g_windowMemory || !window_geometry_visible(&g_windowRect)) return 0;
+    ZeroMemory(&wp, sizeof(wp));
+    wp.length = sizeof(wp);
+    wp.flags = 0;
+    wp.rcNormalPosition = g_windowRect;
+    wp.showCmd = g_windowMax ? SW_MAXIMIZE : SW_SHOWNORMAL;
+    return SetWindowPlacement(hwnd, &wp) != 0;
+}
+
+/* 解析 "#WINDOW=" 后面的 "x,y,w,h"。手写解析而不用 swscanf：
+   swscanf 会把整套 scanf 引擎链进 exe（实测静态版 +49 KB，占总体积 40%+），
+   本项目的卖点就是小体积单文件，这里只认十进制整数即可。 */
+static int parse_window_value(const WCHAR *v, RECT *out)
+{
+    WCHAR *e;
+    long val[4];
+    for (int i = 0; i < 4; i++) {
+        while (*v == L' ' || *v == L'\t') v++;
+        if (*v == 0) return 0;
+        val[i] = wcstol(v, &e, 10);
+        if (e == v) return 0;                       /* 不是数字 */
+        v = e;
+        if (i < 3) {
+            if (*v != L',') return 0;               /* 少一个逗号 */
+            v++;
+        }
+    }
+    if (val[2] <= 0 || val[3] <= 0) return 0;
+    out->left   = (LONG)val[0];
+    out->top    = (LONG)val[1];
+    out->right  = (LONG)(val[0] + val[2]);
+    out->bottom = (LONG)(val[1] + val[3]);
+    return 1;
+}
+
 static void load_config(void)
 {
     WCHAR path[MAX_PATH * 2];
@@ -779,6 +834,9 @@ static void load_config(void)
     g_noCache = 0;
     g_sysPanel = 1;
     g_xpanelsN = 0;
+    g_windowMemory = 0;
+    g_windowMax = 0;
+    ZeroMemory(&g_windowRect, sizeof(g_windowRect));
     g_checkPos = 0;
     g_checking = 0;
     header_reset();
@@ -824,6 +882,12 @@ static void load_config(void)
                 WCHAR *v = line + 10;
                 while (*v == L' ' || *v == L'\t') v++;
                 g_sysPanel = (*v == L'0' || *v == L'n' || *v == L'N' || *v == L'否' || *v == L'关') ? 0 : 1;
+            } else if (!_wcsnicmp(line, L"#WINDOW=", 8)) {
+                if (parse_window_value(line + 8, &g_windowRect)) g_windowMemory = 1;
+            } else if (!_wcsnicmp(line, L"#WINDOWMAX=", 11)) {
+                WCHAR *v = line + 11;
+                while (*v == L' ' || *v == L'\t') v++;
+                g_windowMax = (*v == L'1' || *v == L'y' || *v == L'Y') ? 1 : 0;
             } else if (!_wcsnicmp(line, L"#PANEL=", 7)) {
                 WCHAR *v = line + 7;
                 size_t ln;
@@ -943,6 +1007,13 @@ static int save_config_ex(const WCHAR *path, UINT cp, int onlyVisible, int backu
     if (g_viewPref) { write_conv(h, L"#VIEW=icon"); write_crlf(h); }
     if (!g_sysPanel) { write_conv(h, L"#SYSPANEL=0"); write_crlf(h); }
     if (g_noCache)   { write_conv(h, L"#NOCACHE=1"); write_crlf(h); }
+    if (g_windowMemory) {
+        _snwprintf(line, 4095, L"#WINDOW=%d,%d,%d,%d", g_windowRect.left, g_windowRect.top,
+                   g_windowRect.right - g_windowRect.left, g_windowRect.bottom - g_windowRect.top);
+        line[4095] = 0;
+        write_conv(h, line); write_crlf(h);
+        if (g_windowMax) { write_conv(h, L"#WINDOWMAX=1"); write_crlf(h); }
+    }
     for (int k = 0; k < g_xpanelsN; k++) {          /* 界面里新建的空面板：靠这几行记住 */
         _snwprintf(line, 4095, L"#PANEL=%s", g_xpanels[k]);
         line[4095] = 0;
@@ -2795,6 +2866,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         cache_save();                       /* 万一图标还没填完就退出，也把已有的存下来 */
+        if (g_windowSaveEnabled) {
+            WINDOWPLACEMENT wp;
+            ZeroMemory(&wp, sizeof(wp));
+            wp.length = sizeof(wp);
+            if (GetWindowPlacement(hwnd, &wp)) {
+                g_windowRect = wp.rcNormalPosition;
+                g_windowMemory = 1;
+                g_windowMax = (wp.showCmd == SW_MAXIMIZE) ? 1 : 0;
+                save_config();
+            }
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -2836,6 +2918,12 @@ static void selftest(const WCHAR *outfile, const WCHAR *kw)
     }
     n += _snwprintf(rep, ARRAYSIZE(rep), L"标题=%s\r\n总条目=%d\r\n其中内置(%s)=%d\r\n面板数=%d\r\n配置文件=%s\r\n",
                     g_appTitle, g_count, SYSPANEL_NAME, g_biN, g_panelN, g_cfgPath);
+    if (g_windowMemory)
+        n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n, L"窗口几何=%d,%d,%d,%d%s\r\n",
+                        g_windowRect.left, g_windowRect.top, g_windowRect.right - g_windowRect.left,
+                        g_windowRect.bottom - g_windowRect.top, g_windowMax ? L" (最大化)" : L"");
+    else
+        n += _snwprintf(rep + n, ARRAYSIZE(rep) - (size_t)n, L"窗口几何=默认\r\n");
     for (int j = 0; j < g_panelN; j++) {
         int c = 0;
         for (int i = 0; i < g_count; i++) if (!wcscmp(g_items[i].panel, g_panels[j])) c++;
@@ -3150,6 +3238,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
     }
     if (argv) LocalFree(argv);
 
+    load_config();
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
@@ -3171,6 +3260,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmdline, int show)
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1020, 660,
         NULL, NULL, hi, NULL);
     if (!hwnd) return 1;
+    apply_window_memory(hwnd);
+    g_windowSaveEnabled = 1;
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
 
